@@ -1,0 +1,996 @@
+package com.dramafactory.app.ui
+
+import android.net.Uri
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.dramafactory.app.AppGraph
+import com.dramafactory.app.update.UpdateChecker
+import com.dramafactory.core.quality.AssetAuditor
+import com.dramafactory.core.quality.StylePreset
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * 设置页ViewModel（P0）——包装SettingsLogic并接AppGraph真实引擎。
+ */
+class SettingsViewModel : ViewModel() {
+
+    private val logic = SettingsLogic(
+        videoProviderFor = { AppGraph.resolveVideoProviderFor(it) },
+        configIdFor = { AppGraph.videoConfigIdFor(it) },
+        keyVault = AppGraph.keyVault,
+        configId = AppGraph.videoConfigIdFor("agnes"),   // 默认 agnes（按 region 分池）
+        activate = { AppGraph.setActiveVideoProvider(it) },
+        videoModelReader = { AppGraph.currentAgnesVideoModel },
+        videoModelPersister = { AppGraph.setAgnesVideoModel(it) },
+    )
+    val state: StateFlow<SettingsLogic.UiState> get() = logic.state
+
+    /** v1.9.24：Agnes 视频模型列表（含自动选型） */
+    val agncsVideoModels: List<Pair<String, String>> get() =
+        listOf(AppGraph.AUTO_VIDEO_MODEL to "智能选择（按参考图/视频参数自动匹配）") +
+            AppGraph.agnes.listModels().filter { it.id.startsWith("agnes-video") }
+                .map { it.id to it.label }
+
+    init {
+        refresh()
+        // v1.7.18：接线自定义模型持久化（此前从未接线 → 保存只写 KeyVault，provider_configs 表
+        // 从不落库、运行时从不读取，「自定义模型添加后不能用」的根因）。
+        logic.persistCustomConfig = { cfg ->
+            val extra = runCatching {
+                kotlinx.serialization.json.Json.encodeToString(
+                    kotlinx.serialization.json.JsonObject.serializer(),
+                    kotlinx.serialization.json.buildJsonObject {
+                        put("base_url", kotlinx.serialization.json.JsonPrimitive(cfg.baseUrl))
+                        put("submit_note", kotlinx.serialization.json.JsonPrimitive(cfg.submitNote))
+                    })
+            }.getOrDefault("{}")
+            AppGraph.dao.upsertProviderConfig(com.dramafactory.app.data.ProviderConfigEntity(
+                config_id = "custom-video",
+                channel = AppGraph.CONFIG_VIDEO,
+                provider_id = "custom",
+                model = cfg.modelId,
+                key_cipher = ByteArray(0),   // 明文 Key 在 KeyVault("custom-video")，表内不留密文
+                key_masked = maskKey(cfg.apiKey),
+                extra_params = extra,
+                is_verified = true,
+                updated_at = System.currentTimeMillis(),
+            ))
+            AppGraph.refreshConfiguredProviders()
+        }
+        loadVideoParams()
+        // v1.9.3：进入设置页即静默检查一次更新（后台 scope，跨页面/离页不中断）
+        checkUpdate()
+    }
+
+    // ---- 更新通道（v1.9.3）----
+    // Gitee Release 作为唯一数据源；注入当前 versionName（BuildConfig）与共享 HttpClient。
+    private val updateChecker: com.dramafactory.app.update.UpdateChecker by lazy {
+        com.dramafactory.app.update.UpdateChecker(
+            httpClient = com.dramafactory.core.provider.SharedHttp.client,
+            currentVersionName = try {
+                com.dramafactory.app.BuildConfig.VERSION_NAME
+            } catch (_: Throwable) { "0.0.0" },
+        )
+    }
+
+    /** 手动/自动检查更新：挂后台 scope（IO），结果写入 logic 状态机 */
+    fun checkUpdate() = AppGraph.backgroundScope.launch {
+        logic.checkUpdate { updateChecker.check() }
+    }
+
+    /** 忽略当前新版本提示（仅本次会话隐藏，下次进页仍会重新检查） */
+    fun dismissUpdate() = logic.dismissUpdate()
+
+    // ---- 在线下载安装（v1.9.4 方案B）----
+    private val apkUpdater: com.dramafactory.app.update.ApkUpdater by lazy {
+        com.dramafactory.app.update.ApkUpdater(
+            httpClient = com.dramafactory.core.provider.SharedHttp.client,
+            appContext = AppGraph.appContext(),
+            authority = "com.dramafactory.app.fileprovider",
+        )
+    }
+
+    /**
+     * 下载 APK 并调起系统安装器（Gitee 直链）。
+     * 全程走 backgroundScope（IO）：下载进度写入 logic 状态机，UI 显示进度条；
+     * 完成后自动调起安装 Intent（用户需点「安装」确认——Android 不允许静默安装）。
+     */
+    fun downloadAndInstall(url: String) = AppGraph.backgroundScope.launch {
+        logic.onDownloadStart()
+        var doneFile: java.io.File? = null
+        apkUpdater.download(url).collect { ev ->
+            when (ev) {
+                is com.dramafactory.app.update.ApkUpdater.DownloadEvent.Progress ->
+                    logic.onDownloadProgress(ev.bytes, ev.total)
+                is com.dramafactory.app.update.ApkUpdater.DownloadEvent.Done -> {
+                    doneFile = ev.apkFile
+                    logic.onDownloadDone()
+                }
+                is com.dramafactory.app.update.ApkUpdater.DownloadEvent.Error ->
+                    logic.onDownloadError(ev.message)
+            }
+        }
+        doneFile?.let { apkUpdater.install(it) }
+    }
+
+    private fun maskKey(key: String): String =
+        if (key.length <= 6) "***" else key.take(3) + "***" + key.takeLast(3)
+
+    fun refresh() = viewModelScope.launch { withContext(Dispatchers.IO) { logic.refresh() } }
+    fun onKeyChanged(text: String) = logic.onKeyChanged(text)
+
+    /** v1.8.9：Agnes 站点切换后，视频 Key 池目标切到对应 region 的 configId 并刷新掩码 */
+    fun onAgnesRegionChanged(region: com.dramafactory.core.provider.AgnesRegion) {
+        // v1.9.0：仅当当前选中 agnes 时跟随 region 切换 Key 池；其他供应商不受影响
+        if (logic.state.value.selectedProviderId == "agnes") {
+            logic.updateConfigId(AppGraph.videoConfigIdFor("agnes"))
+        }
+        refresh()
+    }
+
+    /** 「测试连通」按钮：调Agnes validateKey显示成功/失败 */
+    fun testConnection() = viewModelScope.launch { logic.testConnection() }
+
+    /**
+     * v1.9.2：供应商列表逐家「测试」——直接验证该家连通性，不要求先选中该供应商。
+     * Key 来源：该家为当前选中且输入框有新 Key → 用新 Key；否则用该家在 KeyVault 已存的 Key。
+     */
+    fun testProvider(providerId: String, onResult: (SettingsLogic.TestResult) -> Unit) = viewModelScope.launch {
+        val r = withContext(Dispatchers.IO) {
+            val label = ProviderRegistry.byId(providerId)?.label ?: providerId
+            val typed = if (logic.state.value.selectedProviderId == providerId)
+                logic.state.value.keyInput.trim().takeIf { it.isNotBlank() } else null
+            val stored = runCatching {
+                AppGraph.keyVault.load(AppGraph.videoConfigIdFor(providerId))
+            }.getOrNull().orEmpty()
+            val key = typed ?: stored
+            when {
+                key.isBlank() -> SettingsLogic.TestResult.Failure("尚未配置 $label 的 Key（先保存或切到它输入）")
+                else -> {
+                    val provider = AppGraph.resolveVideoProviderFor(providerId, overrideKey = key)
+                    val result = runCatching { provider.validateKey(key).getOrThrow() }
+                    when {
+                        result.isSuccess -> {
+                            val info = result.getOrThrow()
+                            if (info.ok) SettingsLogic.TestResult.Success(info.latencyMs)
+                            else SettingsLogic.TestResult.Failure(info.detail.ifEmpty { "连通失败" })
+                        }
+                        else -> SettingsLogic.TestResult.Failure(
+                            result.exceptionOrNull()?.message ?: "未知错误")
+                    }
+                }
+            }
+        }
+        onResult(r)
+    }
+
+    /** 保存到KeyVault（EncryptedSharedPreferences） */
+    fun saveKey() = viewModelScope.launch {
+        val ok = withContext(Dispatchers.IO) { logic.saveKey(forceWithoutTest = false) }
+        if (!ok) {
+            // 未测试通过或输入为空：UI按saved=false展示提示（force路径留给用户显式选择）
+            logic.onKeyChanged(logic.state.value.keyInput)
+        }
+    }
+
+    fun deleteKey() = viewModelScope.launch { withContext(Dispatchers.IO) { logic.deleteKey() } }
+
+    // ---- 供应商选择 + 自定义模型（第四轮）----
+    fun selectProvider(providerId: String) { logic.selectProvider(providerId) }
+    fun onVideoModelChanged(modelId: String?) = logic.onVideoModelChanged(modelId)
+    fun saveVideoModel() = viewModelScope.launch { withContext(Dispatchers.IO) { logic.saveVideoModel() } }
+    fun onCustomFieldChanged(field: String, value: String) = logic.onCustomFieldChanged(field, value)
+    fun saveCustomModel() = viewModelScope.launch {
+        withContext(Dispatchers.IO) { logic.saveCustomModel() }
+    }
+
+    // ---- v1.7.18：视频参数（多参充分利用）----
+    private val _videoParams = MutableStateFlow(com.dramafactory.core.model.VideoParams())
+    val videoParams: StateFlow<com.dramafactory.core.model.VideoParams> get() = _videoParams
+
+    fun loadVideoParams() = viewModelScope.launch {
+        val p = withContext(Dispatchers.IO) {
+            runCatching {
+                com.dramafactory.core.model.VideoParams.fromExtra(
+                    AppGraph.dao.verifiedConfig(AppGraph.CONFIG_VIDEO)?.extra_params)
+            }.getOrDefault(com.dramafactory.core.model.VideoParams())
+        }
+        _videoParams.value = p
+    }
+
+    fun setVideoParams(p: com.dramafactory.core.model.VideoParams) { _videoParams.value = p }
+
+    /** 保存视频参数到 provider_configs.video.extra_params 并立即生效 */
+    fun saveVideoParams() = viewModelScope.launch {
+        val p = _videoParams.value
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val cur = AppGraph.dao.verifiedConfig(AppGraph.CONFIG_VIDEO)
+                val extra = com.dramafactory.core.model.VideoParams.mergeIntoExtra(cur?.extra_params, p)
+                if (cur != null) {
+                    AppGraph.dao.upsertProviderConfig(
+                        cur.copy(extra_params = extra, updated_at = System.currentTimeMillis()))
+                } else {
+                    AppGraph.dao.upsertProviderConfig(com.dramafactory.app.data.ProviderConfigEntity(
+                        config_id = "custom-video", channel = AppGraph.CONFIG_VIDEO,
+                        provider_id = "agnes", model = "agnes-video-v2.0",
+                        key_cipher = ByteArray(0), key_masked = "",
+                        extra_params = extra, is_verified = false,
+                        updated_at = System.currentTimeMillis()))
+                }
+            }
+            AppGraph.videoParams = p
+        }
+        logic.onKeyChanged("")   // 仅触发 UI 状态刷新，不语义依赖
+    }
+
+    // ---- v1.7.18：图像模型配置（Agnes 图像 key + 自定义图像模型）----
+    private val _imageMasked = MutableStateFlow<String?>(null)
+    val imageMasked: StateFlow<String?> get() = _imageMasked
+
+    fun refreshImageKey() = viewModelScope.launch {
+        val m = withContext(Dispatchers.IO) {
+            runCatching {
+                AppGraph.keyVault.masked(
+                    com.dramafactory.core.provider.agnesScopedConfigId(
+                        AppGraph.CONFIG_IMAGE,
+                        com.dramafactory.core.provider.DefaultTextModelRouter.agnesRegion,
+                    )
+                )
+            }.getOrNull()?.takeIf { it != "<empty>" }
+        }
+        _imageMasked.value = m
+    }
+
+    /** 保存 Agnes 图像专用 Key（独立于视频通道；v1.8.9 起按 region 分池） */
+    fun saveImageKey(key: String) = viewModelScope.launch {
+        if (key.trim().isEmpty()) return@launch
+        withContext(Dispatchers.IO) {
+            runCatching {
+                AppGraph.keyVault.save(
+                    com.dramafactory.core.provider.agnesScopedConfigId(
+                        AppGraph.CONFIG_IMAGE,
+                        com.dramafactory.core.provider.DefaultTextModelRouter.agnesRegion,
+                    ), "agnes", key.trim())
+            }
+        }
+        refreshImageKey()
+    }
+
+    /** 保存自定义图像模型（base_url/model/key → channel=image 的 custom 记录） */
+    fun saveCustomImageModel(baseUrl: String, modelId: String, key: String) {
+        val b = baseUrl.trim(); val m = modelId.trim(); val k = key.trim()
+        if (!b.startsWith("http") || m.isEmpty() || k.isEmpty()) return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { AppGraph.keyVault.save("custom-${AppGraph.CONFIG_IMAGE}", "custom", k) }
+                val extra = runCatching {
+                    kotlinx.serialization.json.Json.encodeToString(
+                        kotlinx.serialization.json.JsonObject.serializer(),
+                        kotlinx.serialization.json.buildJsonObject {
+                            put("base_url", kotlinx.serialization.json.JsonPrimitive(b))
+                        })
+                }.getOrDefault("{}")
+                runCatching {
+                    AppGraph.dao.upsertProviderConfig(com.dramafactory.app.data.ProviderConfigEntity(
+                        config_id = "custom-image", channel = AppGraph.CONFIG_IMAGE,
+                        provider_id = "custom", model = m,
+                        key_cipher = ByteArray(0), key_masked = maskKey(k),
+                        extra_params = extra, is_verified = true,
+                        updated_at = System.currentTimeMillis()))
+                }
+                AppGraph.refreshConfiguredProviders()
+            }
+        }
+    }
+}
+
+/**
+ * 渲染队列页ViewModel——包装QueueLogic并接DefaultRenderQueue+Room。
+ */
+class QueueViewModel(private val episodeId: String) : ViewModel() {
+
+    // ★第五轮加固：queueFor/budgetGuard构造失败（AppGraph未就绪等）时兜底Fakes队列，
+    // VM仍可创建，页面显示空状态而非闪退。
+    private val logic = runCatching {
+        QueueLogic(queue = RenderRuntime.queue(), budgetGuard = AppGraph.budgetGuard)
+    }.getOrElse {
+        android.util.Log.e("QueueViewModel", "queue init failed, degraded", it)
+        QueueLogic(queue = DegradedRenderQueue(),
+            budgetGuard = DegradedBudgetGuard())
+    }.apply {
+        // RECONCILE处置落库：重试→PENDING / 放弃→BLOCKED（权威终态）
+        onReconcileResolve = { shotId, retry ->
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.renderTask(shotId)?.let { row ->
+                    AppGraph.dao.upsertRenderTask(
+                        if (retry) row.copy(state = "PENDING", blocked_reason = null)
+                        else row.copy(state = "BLOCKED", blocked_reason = row.blocked_reason ?: "用户放弃")
+                    )
+                }
+            }
+        }
+        // 镜状态实时刷新源：Room render_tasks表（状态 + 失败/放弃/对账原因）
+        shotStateReader = {
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.renderTasksOfEpOrdered(episodeId).associate {
+                    it.shot_id to (it.state to (it.fail_reason ?: it.blocked_reason))
+                }
+            }
+        }
+        // v1.9.18 队列管理：删除单镜（shots + render_tasks 全清，彻底移除该镜）
+        onDeleteShot = { shotId ->
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.deleteShot(shotId)
+                AppGraph.dao.deleteRenderTask(shotId)
+            }
+        }
+        // v1.9.18 队列管理：重试失败/已放弃的镜——重置 PENDING 并清失败原因
+        onRetryShot = { shotId ->
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.renderTask(shotId)?.let { row ->
+                    AppGraph.dao.upsertRenderTask(
+                        row.copy(state = "PENDING", fail_reason = null, blocked_reason = null))
+                }
+            }
+        }
+        // v1.9.18 队列管理：清空本集队列（仅清 render_tasks，shots 分镜数据保留）
+        onClearQueue = { ep ->
+            withContext(Dispatchers.IO) { AppGraph.dao.deleteRenderTasksOf(ep) }
+        }
+        // v1.9.20：storyboard_gate 详情——查 sb_check 含 error 的镜（原因码取自 AiStoryboardDirector 六铁律校验）
+        storyboardBlockReader = { epId ->
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.shotsOf(epId)
+                    .filter { it.sb_check.contains("error", ignoreCase = true) }
+                    .map { it.shot_id to it.sb_check.removePrefix("error:") }
+            }
+        }
+        // 第六轮：图生视频关键帧 + 视频参考解析器（从 shots 表读取本镜已设参考）
+        setKeyframeResolver { shotId ->
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.shotKeyframes(shotId)?.let { it.first_image_uri to it.last_image_uri }
+                    ?: (null to null)
+            }
+        }
+        // v1.7.2：套用 pavo 锁脸逻辑——每镜注入角色/场景资产参考图(i2i)，保证角色长相跨镜一致。
+        // v1.7.15：优先读本镜 first_asset_ids（分镜生成时 LLM 已按 asset_id 引用），只注入该镜引用的资产图；
+        //         空引用时回退项目级 character/scene 前4张（旧行为兜底）。
+        setAssetImageResolver { shotId ->
+            withContext(Dispatchers.IO) {
+                val epId = shotId.substringBeforeLast("_shot").takeIf { it.contains("_ep") } ?: shotId
+                val projectId = epId.substringBeforeLast("_ep").ifBlank { epId }
+                runCatching {
+                    val shot = AppGraph.dao.shotKeyframes(shotId) ?: AppGraph.dao.shotsOf(epId).firstOrNull { it.shot_id == shotId }
+                    val refIds = AssetCatalog.parseRefIds(shot?.first_asset_ids)
+                    val all = AppGraph.dao.assetsAllOf(projectId)
+                    // v1.7.21：改走 AssetCatalog.resolveRefUris —— 引用母卡时展开其参考图套装
+                    // （front_bust 优先、单角色最多 2 张），否则 v1.7.20 生成的 4 张参考图
+                    // 一张都进不了渲染，锁脸还是只靠母卡那一张图。
+                    // 取不到时走项目级兜底（多角色项目不兜底，宁可不锁脸也不串脸）。
+                    AssetCatalog.resolveRefUris(all, refIds)
+                        .ifEmpty { AssetCatalog.fallbackUris(all) }
+                }.getOrDefault(emptyList())
+            }
+        }
+        setReferenceVideoResolver { shotId ->
+            // 仅当当前视频模型支持视频参考时返回；否则空（Agnes标记支持）
+            withContext(Dispatchers.IO) {
+                val cfg = AppGraph.dao.verifiedConfig("video")
+                val supported = (AppGraph.video.listModels().firstOrNull { it.id == (cfg?.model ?: "agnes") }
+                    ?: AppGraph.video.listModels().first()).supportsVideoReference
+                if (supported) AppGraph.dao.shotReferenceVideo(shotId) else null
+            }
+        }
+    }
+    val state: StateFlow<QueueLogic.UiState> get() = logic.state
+
+    /**
+     * 当前视频模型是否支持视频参考（UI 门控「上传参考视频」入口）。
+     *
+     * 原实现是组合期调用的 `videoModelSupportsReference(): Boolean`，内部 runBlocking 同步查 Room，
+     * 而 LazyColumn 的**每一镜**都会调它一次 → 每次重组触发 N 次主线程 IO（列表越长卡得越明显）。
+     * 改为 ViewModel 构造时异步加载一次，缓存为 StateFlow 供 UI 订阅。
+     */
+    private val _videoRefSupported = MutableStateFlow(false)
+    val videoRefSupported: StateFlow<Boolean> = _videoRefSupported
+
+    /** 队列运行时单例接线（见RenderRuntime） */
+    init {
+        logic.startWatching(viewModelScope)
+        viewModelScope.launch {
+            val cfg = runCatching { withContext(Dispatchers.IO) { AppGraph.dao.verifiedConfig("video") } }.getOrNull()
+            val model = cfg?.model ?: "agnes"
+            _videoRefSupported.value =
+                AppGraph.video.listModels().firstOrNull { it.id == model }?.supportsVideoReference ?: false
+        }
+    }
+    override fun onCleared() { logic.stopWatching(); super.onCleared() }
+
+    fun enqueue(shots: List<com.dramafactory.core.model.ShotMeta>) =
+        viewModelScope.launch { logic.enqueue(episodeId, shots) }
+    fun pause() = viewModelScope.launch { logic.pause() }
+    fun resume() = viewModelScope.launch { logic.resume() }
+    fun cancelShot(shotId: String) = logic.cancelShot(shotId)
+    fun confirmBudget() = viewModelScope.launch { logic.confirmBudget() }
+    fun dismissBudgetConfirm() = logic.dismissBudgetConfirm()
+    fun openReconcileDialog(shotId: String, reason: String) = logic.openReconcileDialog(shotId, reason)
+    fun resolveReconcile(retry: Boolean) = viewModelScope.launch { logic.resolveReconcile(retry) }
+    fun dismissReconcileDialog() = logic.dismissReconcileDialog()
+    fun clearEnqueueError() = logic.clearEnqueueError()
+
+    // ==================== v1.9.18：队列管理（删除 / 重试 / 清空） ====================
+    /** 请求删除某镜（弹二次确认，删除不可逆） */
+    fun requestDeleteShot(shotId: String) = logic.requestDeleteShot(shotId)
+    fun dismissDeleteShot() = logic.dismissDeleteShot()
+    fun confirmDeleteShot() = viewModelScope.launch { logic.confirmDeleteShot() }
+    /** 重试失败/已放弃的镜：重置 PENDING 并清失败原因 */
+    fun retryShot(shotId: String) = viewModelScope.launch { logic.retryShot(shotId) }
+    fun requestClearQueue() = logic.requestClearQueue()
+    fun dismissClearQueue() = logic.dismissClearQueue()
+    fun confirmClearQueue() = viewModelScope.launch { logic.confirmClearQueue(episodeId) }
+
+    // ==================== 第六轮：图生视频 / 视频参考 ====================
+    /** 为某镜设置关键帧（图生视频）：首帧/尾帧 URI 落库 shots 表 */
+    fun setShotKeyframe(shotId: String, first: String?, last: String?) = viewModelScope.launch {
+        withContext(Dispatchers.IO) { AppGraph.dao.setShotKeyframes(shotId, first, last) }
+    }
+    /** 为某镜设置视频参考（仅模型支持时由UI调用） */
+    fun setShotReferenceVideo(shotId: String, uri: String?) = viewModelScope.launch {
+        withContext(Dispatchers.IO) { AppGraph.dao.setShotReferenceVideo(shotId, uri) }
+    }
+}
+
+/**
+ * 项目列表页ViewModel。
+ */
+class ProjectsViewModel : ViewModel() {
+
+    private val logic = ProjectsLogic().apply {
+        persistProject = { name, novel -> ioPersist(name, novel) }
+        loadProjects = { ioLoad() }
+        deleteProjectRow = { id -> withContext(Dispatchers.IO) { AppGraph.dao.deleteProject(id) } }
+    }
+    val state: StateFlow<ProjectsLogic.UiState> get() = logic.state
+    private val _createError = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val createError: kotlinx.coroutines.flow.StateFlow<String?> get() = _createError
+
+    init { refresh() }
+
+    fun refresh() = viewModelScope.launch { logic.refresh() }
+    fun onNameChanged(text: String) = logic.onNameChanged(text)
+    fun importNovel(fileName: String?, text: String?) = logic.importNovel(fileName, text)
+
+    // ---- 剧本导入（第四轮）----
+    fun selectMode(mode: ProjectsLogic.ImportMode) = logic.selectMode(mode)
+    fun onPasteInputChanged(text: String) = logic.onPasteInputChanged(text)
+    fun importDocument(mode: ProjectsLogic.ImportMode, fileName: String?, text: String?, pasted: Boolean) =
+        logic.importDocument(mode, fileName, text, pasted)
+    fun clearImportError() = logic.clearImportError()
+
+    /** 新建项目并返回新id（导航进入项目用）；持久化异常不再静默——落crash日志并提示 */
+    fun create(onCreated: (String?) -> Unit) = viewModelScope.launch {
+        val id = try { logic.createProject() } catch (t: Throwable) {
+            android.util.Log.e("ProjectsViewModel", "createProject failed", t)
+            _createError.value = t.message ?: t.javaClass.simpleName
+            null
+        }
+        onCreated(id)
+    }
+
+    fun delete(projectId: String) = viewModelScope.launch { logic.deleteProject(projectId) }
+
+    // ---- Room IO ----
+    private suspend fun ioPersist(name: String, novel: String?): String = withContext(Dispatchers.IO) {
+        val projectId = com.dramafactory.app.data.PersistenceActionExecutor
+            .writeProject(AppGraph.dao, AppGraph.storageGuard, name, "projects.create").entityIds.single()
+        if (novel != null) {
+            val epId = "${projectId}_ep1"
+            // 剧本模式：script_json存剧本原文；stage_flags标记SCRIPT_MODE，
+            // 资产页据此跳过文本分析直接进分镜编辑（AssetsViewModel读取该标志）
+            val isScript = logic.state.value.importMode == ProjectsLogic.ImportMode.SCRIPT
+            val flags = if (isScript) """{"script_mode":true,"scene_hint":${logic.state.value.sceneHint}}""" else "{}"
+            com.dramafactory.app.data.PersistenceActionExecutor.writeEpisode(AppGraph.dao, AppGraph.storageGuard,
+                com.dramafactory.app.data.EpisodeEntity(episode_id = epId, project_id = projectId, ep_no = 1,
+                    script_json = novel.take(100_000), stage_flags = flags), "projects.create.episode",
+                expectedScript = novel.take(100_000))
+        }
+        projectId
+    }
+    private suspend fun ioLoad(): List<ProjectsLogic.ProjectItem> = withContext(Dispatchers.IO) {
+        AppGraph.dao.listProjects().map {
+            ProjectsLogic.ProjectItem(it.project_id, it.name, createdAt = it.created_at)
+        }
+    }
+}
+
+/**
+ * 资产库页ViewModel。
+ */
+/**
+ * 第十轮：资产页按「剧集」工作——episodeId 为准（项目内分集后，每集独立持有资产/剧本）。
+ * projectId 由 episodeId 推导（{projectId}_ep{n}）。
+ */
+class AssetsViewModel(private val episodeId: String) : ViewModel() {
+    private val projectId: String = episodeId.substringBeforeLast("_ep")
+
+    // 显式类型：generateHandler/enrichHandler 内部需引用本实例，避免 apply 内自引用导致循环类型推断
+    private val logic: AssetsLogic = AssetsLogic().apply {
+        // 资产生成：文本通道出细化prompt → 图像通道出图（双Provider桩接线）
+        // 第九轮：生成 prompt 折叠 era 红线约束（C）；图生图参考图作为 input_images。
+        generateHandler = { card ->
+            withContext(Dispatchers.IO) {
+                val preset = eraPreset   // 第十三轮：按剧本推断的朝代预设
+                // 生图前的 LLM 扩写：把正则抽出的裸名词（如「王莽」）扩成聚焦主体、符合时代红线的
+                // 视觉描述；已有缓存直接用，无缓存则实时扩写并落回卡片（失败回退裸词，不阻断生图）。
+                val basePrompt = logic.ensureEnriched(card)
+                // C. era 红线：正负分离——prompt只带正向，禁词走 negative_prompt API字段
+                // （第十一轮修复：旧实现把禁词表拼进正面prompt，图像模型把"手机/塑料"全画出来了）
+                // T014 任务1：角色类资产额外追加棚拍无干扰背景约束，与场景/环境解耦
+                // v1.7.17：prompt 组装 / 画幅 / 调用统一走 AssetImageGenerator。
+                // 图像端不接受 negative_prompt 字段，禁词在生成器内并入正向；
+                // 角色卡丢弃 cinematic、9:16 framing 等场景化语义（与纯色棚拍底对冲，
+                // 是「角色卡背景清不干净」的根因），纯色背景指令放在 prompt 最末。
+                val kindKey = when (card.kind) {
+                    AssetsLogic.Kind.CHARACTER -> AssetImageGenerator.KIND_CHARACTER
+                    AssetsLogic.Kind.SCENE -> AssetImageGenerator.KIND_SCENE
+                    AssetsLogic.Kind.PROP -> AssetImageGenerator.KIND_PROP
+                    else -> "local"
+                }
+                val erPrompt = AssetImageGenerator.buildConstrained(kindKey, basePrompt, preset)
+                val url = AssetImageGenerator.generate(
+                    provider = AppGraph.image,
+                    kind = kindKey,
+                    basePrompt = basePrompt,
+                    preset = preset,
+                    inputImages = if (card.referenceImageUri != null) listOf(card.referenceImageUri) else emptyList())
+                // A. 资产质量闸门：G1 文件级硬校验 + G2 多模态打分（defects 直接拒，重试≤3）
+                runCatching { auditGeneratedAsset(card.assetId, url, erPrompt, card) }
+                Result.success(url)
+            }
+        }
+        // 资产卡 LLM 扩写：把裸名词扩成符合时代红线的视觉描述（core 的 AssetPromptEnricher + 已接好的文本模型）。
+        enrichHandler = { card ->
+            withContext(Dispatchers.IO) {
+                AppGraph.storageGuard.requireReady()
+                val preset = eraPreset
+                val kindKey = when (card.kind) {
+                    AssetsLogic.Kind.CHARACTER -> "character"
+                    AssetsLogic.Kind.SCENE -> "scene"
+                    AssetsLogic.Kind.PROP -> "prop"
+                    else -> "prop"
+                }
+                val enriched = com.dramafactory.core.quality.AssetPromptEnricher.enrich(
+                    chat = { msg ->
+                        runCatching {
+                            AppGraph.text.chat(com.dramafactory.core.model.ChatRequest(messages = listOf(
+                                com.dramafactory.core.model.ChatMessage("user", msg))))
+                        }.getOrNull()?.content ?: ""
+                    },
+                    kind = kindKey, name = card.prompt,
+                    eraLabel = preset.era.label, forbidden = preset.forbiddenEraTerms)
+                Result.success(enriched)
+            }
+        }
+        reviewPersist = { assetId, st ->
+            withContext(Dispatchers.IO) {
+                com.dramafactory.app.data.PersistenceActionExecutor.setReviewStateVerified(
+                    AppGraph.dao, AppGraph.storageGuard, assetId, st, projectId, "asset.review")
+            }
+        }
+        // ★第十一轮：生成结果落盘——内存卡与assets表双写，进程被杀不丢图
+        generateResultPersist = { assetId, url ->
+            withContext(Dispatchers.IO) {
+                com.dramafactory.app.data.PersistenceActionExecutor.setAssetRemoteUrlVerified(
+                    AppGraph.dao, AppGraph.storageGuard, assetId, url, "asset.remote_url")
+            }
+        }
+        // v1.9.12：LLM 扩写视觉描述落盘（assets.enriched_prompt）——ensureEnriched/polish 实时扩写后双写
+        enrichedPersist = { assetId, text ->
+            withContext(Dispatchers.IO) {
+                AppGraph.storageGuard.requireReady()
+                AppGraph.dao.setAssetEnrichedPrompt(assetId, text, System.currentTimeMillis())
+                val saved = AppGraph.dao.assetsAllOf(projectId).firstOrNull { it.asset_id == assetId }
+                check(saved?.enriched_prompt == text) { "扩写提示词写入后读回不一致：$assetId" }
+            }
+        }
+    }
+    val assets: StateFlow<List<AssetsLogic.AssetCard>> get() = logic.assets
+
+    /** v1.7.1 实时联动：进入资产页/切项目时从 Room 重读，让 AI 写入的资产立刻可见。
+     * v1.7.5 修重启后空白：AssetsPage 传进来的 projectId 实际是 episodeId（nav.currentEpisodeId），
+     * 直接当 project_id 查 assetsAllOf 会查不到（资产按真 project_id 落库）。这里统一用 VM 内部
+     * 已正确推导的 projectId（episodeId.substringBeforeLast("_ep")），忽略外部传入值。 */
+    suspend fun refreshFromDb(@Suppress("UNUSED_PARAMETER") projectId: String = this.projectId) {
+        logic.refreshFromDb(this.projectId)
+    }
+
+    // 第九轮：G2 多模态审计 describer（Agnes 文本 3.0 Flash 带图，enable_thinking=false）
+    private val describer = AssetAuditor.agnesDescriber(AppGraph.text)
+
+    /**
+     * 对生成结果执行 G1+G2 资产质量闸门，并落库质量状态（A 子模块）。
+     * G1 失败直接 rejected（零模型成本）；G2 调 Agnes 文本 3.0 Flash 打分，defects 非空直接拒。
+     */
+    private suspend fun auditGeneratedAsset(assetId: String, imageUrl: String, prompt: String, card: AssetsLogic.AssetCard) {
+        // 仅对可下载的 http(s)/data uri 执行（本地 file:// 跳过网络解码，仅记 pending）
+        if (!imageUrl.startsWith("http") && !imageUrl.startsWith("data:image")) return
+        runCatching {
+            val bytes = fetchBytes(imageUrl) ?: return@runCatching
+            // ★第十轮：图像先降采样到512px内JPEG(quality 80)，base64后约几十KB——
+            // 杜绝把百万级base64塞进请求（ContextWindowExceededError 根因）
+            val smallUri = runCatching {
+                val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    ?: throw IllegalStateException("decode fail")
+                val scale = 512.0 / maxOf(bmp.width, bmp.height).coerceAtLeast(1)
+                val w = (bmp.width * scale).toInt().coerceIn(1, 512)
+                val h = (bmp.height * scale).toInt().coerceIn(1, 512)
+                val small = android.graphics.Bitmap.createScaledBitmap(bmp, w, h, true)
+                val bos = java.io.ByteArrayOutputStream()
+                small.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, bos)
+                "data:image/jpeg;base64," + android.util.Base64.encodeToString(
+                    bos.toByteArray(), android.util.Base64.NO_WRAP)
+            }.getOrNull() ?: return@runCatching
+            val dataUri = if (imageUrl.startsWith("data:image") && imageUrl.length < smallUri.length * 4) imageUrl
+                else smallUri
+            val outcome = qualityEngine.auditAsset(
+                imageBytes = bytes, imageDataUri = dataUri, description = prompt,
+                assetType = card.kind.name.lowercase(), pose = card.poseRole ?: "",
+                describer = describer)
+            AppGraph.dao.setAssetQuality(
+                assetId = assetId,
+                qualityScore = outcome.qualityScore,
+                auditState = outcome.auditState.name.lowercase(),
+                defectsJson = outcome.defectsJson(),
+                rejectReason = outcome.rejectReason,
+                g1ErrorCode = outcome.g1ErrorCode,
+                faceRatio = outcome.faceRatio,
+                poseRole = outcome.poseRole,
+                updatedAt = System.currentTimeMillis())
+            // 同步到内存卡（UI 显示评分/拒绝原因）
+            logic.updateQuality(assetId, outcome.auditState.name.lowercase(), outcome.qualityScore,
+                outcome.rejectReason, outcome.defectsJson())
+        }
+    }
+
+    private fun fetchBytes(url: String): ByteArray? = runCatching {
+        if (url.startsWith("data:image")) {
+            val b64 = url.substringAfter(",")
+            android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+        } else {
+            java.net.URL(url).openStream().use { it.readBytes() }
+        }
+    }.getOrNull()
+
+    private val qualityEngine = QualityEngine()
+
+    /** 剧本模式状态：stage_flags.script_mode=true 时资产页显示「一键提取」入口 */
+    private val _scriptMode = kotlinx.coroutines.flow.MutableStateFlow(false)
+    val scriptMode: kotlinx.coroutines.flow.StateFlow<Boolean> get() = _scriptMode
+    /** 第九轮：本集已放行跨时代器物清单（时代红线按剧集放行） */
+    private val _allowedCrossEra = kotlinx.coroutines.flow.MutableStateFlow<List<String>>(emptyList())
+    val allowedCrossEra: kotlinx.coroutines.flow.StateFlow<List<String>> get() = _allowedCrossEra
+
+    /**
+     * 第十三轮：按剧本自动推断的时代预设（默认西汉，init 时 LLM/规则检测后更新）。
+     * 生成链路一律用 [eraPreset] 而非写死的 HAN_PRESET。
+     */
+    @Volatile private var eraKey: String = "han"
+    private val _eraLabel = kotlinx.coroutines.flow.MutableStateFlow("西汉末年至新莽时期（默认）")
+    val eraLabel: kotlinx.coroutines.flow.StateFlow<String> get() = _eraLabel
+    private val eraPreset: com.dramafactory.core.quality.StylePreset
+        get() = com.dramafactory.core.quality.EraDetector.presetFor(eraKey)
+    /**
+     * 第六轮修复（提取无反应根因）：剧本原文从 episodes.script_json 异步读取。
+     * 旧实现用 `var scriptText` 普通字段，init 协程还没返回时按钮已可点击，
+     * 此时 scriptText 仍为 null → extractFromScript 直接 return，列表永远不更新。
+     * 改用 CompletableDeferred 持有剧本，提取前 await（挂起非阻塞），确保读到已加载的剧本，
+     * 且不会在单线程测试调度器上造成阻塞死锁（CompletableFuture.get() 会阻塞线程）。
+     */
+    private val scriptText = kotlinx.coroutines.CompletableDeferred<String?>()
+    /** 一键提取结果提示（如"已提取12张卡" / "未识别到可提取的资产"） */
+    private val _extractMessage = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+    val extractMessage: kotlinx.coroutines.flow.StateFlow<String?> get() = _extractMessage
+
+    /**
+     * v1.9.2：资产库页副标题——按「当前剧集」动态变化（项目名 + 第几集），
+     * 不再写死"莽途·墨痕初现 · 第 1 集"。切集后 AssetsPage 重建 VM 即拿到新副标题。
+     */
+    private val _subtitle = kotlinx.coroutines.flow.MutableStateFlow("资产库")
+    val subtitle: kotlinx.coroutines.flow.StateFlow<String> get() = _subtitle
+
+    init {
+        // v1.9.2 修复（UncaughtExceptionsBeforeTest 根因）：预载协程原先挂 viewModelScope
+        // （Main dispatcher）。JVM 单测里 runTest 结束即 resetMain，若此时协程仍停在
+        // withContext(IO) 挂起点上，恢复回 Main 会抛 CoroutinesInternalError——协程机制级
+        // 致命错误，CoroutineExceptionHandler 兜不住，会泄漏为全局未捕获异常并污染下一个
+        // runTest。预载全程只做 DB 读 + StateFlow 更新（线程安全，见 AssetsLogic 的
+        // _assets.update CAS），挂 backgroundScope(IO) 即可，全程不依赖 Main dispatcher。
+        AppGraph.backgroundScope.launch {
+            // v1.9.2：副标题按剧集动态推导（项目名 + 第几集）
+            val epNo = episodeId.substringAfterLast("_ep").toIntOrNull() ?: 1
+            val pName = runCatching { withContext(Dispatchers.IO) {
+                AppGraph.dao.project(projectId)?.name
+            } }.getOrNull()?.takeIf { it.isNotBlank() }
+            _subtitle.value = (pName ?: "短剧项目") + " · 第 ${epNo} 集"
+            // 读取本项目第一集的剧本与stage_flags（剧本导入时由ProjectsViewModel写入）
+            val row = runCatching { withContext(Dispatchers.IO) {
+                AppGraph.dao.episode(episodeId) ?: AppGraph.dao.episode("${episodeId}_ep1")
+            } }.getOrNull()
+            scriptText.complete(row?.script_json)
+            _scriptMode.value = AssetsLogic.ScriptAssetExtractor.isScriptMode(row?.stage_flags)
+            // 第六轮：进入即预载本项目的已存资产（含本地上传/参考图），保证列表不空窗
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    AppGraph.dao.assetsOf(projectId, "local")
+                }
+            }.getOrNull()?.let { locals ->
+                for (e in locals) logic.addLocalAsset(
+                    assetId = e.asset_id,
+                    imageUri = e.image_uri,
+                    videoUri = e.video_uri,
+                    prompt = e.prompt)
+            }
+            // ★第十三轮：按剧本自动推断时代红线（LLM优先，规则兜底）
+            val scriptForEra = row?.script_json
+            if (!scriptForEra.isNullOrBlank()) {
+                val llmReady = AppGraph.isInitialized && AppGraph.agnesKeyReady()
+                val det = runCatching {
+                    com.dramafactory.core.quality.EraDetector.detect(scriptForEra, llmReady) { req ->
+                        AppGraph.text.chat(req)
+                    }
+                }.getOrElse { com.dramafactory.core.quality.EraDetector.Detection("han", "", false) }
+                eraKey = det.eraKey
+                _eraLabel.value = det.label + if (det.usedLlm) "" else "（规则推断）"
+            }
+            // ★第十一轮：回填全部已落库资产（含生成的 remote_url），重进项目不丢卡不丢图
+            runCatching {
+                withContext(Dispatchers.IO) { AppGraph.dao.assetsAllOf(projectId) }
+            }.getOrNull()?.forEach { e ->
+                if (e.source == "local") return@forEach   // 本地卡已由上面加载
+                logic.restoreGenerated(
+                    assetId = e.asset_id,
+                    kindName = e.kind,
+                    prompt = e.prompt,
+                    parentId = e.parent_id,
+                    poseRole = e.pose_role,
+                    remoteUrl = e.remote_url,
+                    reviewState = e.review_state,
+                    enrichedPrompt = e.enriched_prompt)
+            }
+        }
+    }
+
+    /** 一键「从剧本提取资产卡」：提取→落库→逐卡触发生成（MVP不要求LLM） */
+    fun extractFromScript() = viewModelScope.launch(
+        // v1.8.2：此前该协程没有任何异常兜底 —— 一旦落库/生成阶段抛出（例如 DB 未就绪、
+        // lateinit 未初始化），异常会一路抛到 Thread.uncaughtExceptionHandler：真机上表现为崩溃，
+        // 单测里表现为异常泄漏到下一个 runTest（CoroutinesInternalError / UncaughtExceptionsBeforeTest）。
+        // 这里统一兜住：记 CrashLog + 把失败转成用户可见提示。
+        kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+            android.util.Log.e("AssetsVM", "extractFromScript crashed", e)
+            runCatching { com.dramafactory.app.CrashLog.record(AppGraph.appContext() ?: return@CoroutineExceptionHandler, "extractFromScript", e) }
+            _extractMessage.value = "提取失败：" + (e.message ?: e.javaClass.simpleName)
+        },
+    ) {
+        // 第六轮修复：await 剧本加载（旧实现直接读可能为null的scriptText字段；
+        // CompletableDeferred.await() 挂起非阻塞，避免单线程调度器死锁）
+        val text = scriptText.await()
+        if (text.isNullOrBlank()) {
+            _extractMessage.value = "未能读取剧本文本（请确认已导入剧本）"
+            return@launch
+        }
+        // 第十轮：大模型自动提取优先（Agnes 文本 3.0 Flash 出结构化JSON），正则兜底
+        _extractMessage.value = "正在用大模型分析文本提取资产…"
+        var seq = 0
+        val idGen = { "sa_${java.util.UUID.randomUUID()}_${seq++}" }
+        // LLM 提取仅在引擎就绪时启用（测试/未配置key环境直接走正则兜底，不发起网络）
+        val llmReady = AppGraph.isInitialized && AppGraph.agnesKeyReady()
+        val llm = if (llmReady) runCatching {
+            com.dramafactory.core.quality.LlmAssetExtractor.extract(text) { req ->
+                AppGraph.text.chat(req)
+            }
+        }.getOrElse {
+            com.dramafactory.core.quality.LlmAssetExtractor.ExtractResult(emptyList(), usedLlm = false)
+        } else com.dramafactory.core.quality.LlmAssetExtractor.ExtractResult(emptyList(), usedLlm = false)
+        val count: Int = if (llm.usedLlm && llm.assets.isNotEmpty()) {
+            var n = 0
+            for (a in llm.assets) {
+                val kind = when (a.kind) {
+                    "character" -> AssetsLogic.Kind.CHARACTER
+                    "scene" -> AssetsLogic.Kind.SCENE
+                    else -> AssetsLogic.Kind.PROP
+                }
+                val desc = if (a.desc.isBlank()) a.name else "${a.name}·${a.desc}"
+                val key = "${kind.name}:$desc"
+                if (logic.assets.value.any { "${it.kind.name}:${it.prompt}" == key }) continue
+                logic.addAsset(idGen(), kind, desc)
+                n++
+            }
+            n
+        } else {
+            logic.extractFromScript(text, idGen)
+        }
+        if (count == 0) {
+            _extractMessage.value = "未能从文本提取到资产（LLM与规则均未命中）"
+            return@launch
+        }
+        _extractMessage.value = (if (llm.usedLlm) "大模型" else "规则") + "提取了${count}张资产卡，正在生成图像…"
+        // 对新增且未生成的卡片触发生成并落库（v1.9.2：生成挂后台scope，切走也不丢）
+        for (card in logic.assets.value.filter { it.remoteUrl == null && it.assetId.startsWith("sa_") }) {
+            withContext(Dispatchers.IO) {
+                com.dramafactory.app.data.PersistenceActionExecutor.writeAsset(AppGraph.dao, AppGraph.storageGuard,
+                    com.dramafactory.app.data.AssetEntity(
+                    asset_id = card.assetId, project_id = projectId, kind = card.kind.name.lowercase(),
+                    prompt = card.prompt, updated_at = System.currentTimeMillis()), "asset.extract")
+            }
+            AppGraph.backgroundScope.launch { logic.generate(card.assetId) }
+        }
+    }
+
+    /** 「逐类生成图像」：对当前分类尚未生成的卡片依次触发生成 */
+    fun generatePendingOfKind(kind: AssetsLogic.Kind) = viewModelScope.launch {
+        for (id in logic.pendingIdsOfKind(kind)) logic.generate(id)
+    }
+
+    fun clearExtractMessage() { _extractMessage.value = null }
+
+    fun add(assetId: String, kind: AssetsLogic.Kind, prompt: String) = viewModelScope.launch {
+        logic.addAsset(assetId, kind, prompt)
+        withContext(Dispatchers.IO) {
+            com.dramafactory.app.data.PersistenceActionExecutor.writeAsset(AppGraph.dao, AppGraph.storageGuard,
+                com.dramafactory.app.data.AssetEntity(
+                asset_id = assetId, project_id = projectId, kind = kind.name.lowercase(),
+                prompt = prompt.trim(), updated_at = System.currentTimeMillis()), "asset.add")
+        }
+        AppGraph.backgroundScope.launch { logic.generate(assetId) }   // 添加即触发生成（后台）
+    }
+
+    fun remove(assetId: String) = viewModelScope.launch {
+        val ids = logic.removeAssetCascade(assetId)
+        withContext(Dispatchers.IO) {
+            com.dramafactory.app.data.PersistenceActionExecutor.deleteAssetsVerified(
+                AppGraph.dao, AppGraph.storageGuard, projectId, ids, "asset.remove")
+        }
+    }
+    /** 第十一轮：停止进行中的生成 */
+    fun stopGenerate(assetId: String) = logic.stopGenerate(assetId)
+
+    /** 第十二轮：批量删除资产（级联子卡），逐个清理DB */
+    fun removeBatch(assetIds: List<String>) = viewModelScope.launch {
+        val ids = logic.removeAssetsCascade(assetIds)
+        withContext(Dispatchers.IO) {
+            com.dramafactory.app.data.PersistenceActionExecutor.deleteAssetsVerified(
+                AppGraph.dao, AppGraph.storageGuard, projectId, ids, "asset.remove")
+        }
+    }
+    /** v1.9.2：资产生成挂 AppGraph.backgroundScope——切走标签/离开页面也不打断，跑完即落库 */
+    fun generate(assetId: String) = AppGraph.backgroundScope.launch {
+        AppGraph.storageGuard.requireReady()
+        logic.generate(assetId)
+    }
+    /**
+     * v1.9.10：手动「润色」——强制用 LLM 重新扩写该资产卡的视觉描述，结果缓存回卡片。
+     * 返回扩写文本（供编辑弹窗回填），扩写失败回退裸词时返回 null。
+     */
+    suspend fun polish(assetId: String): String? = logic.polish(assetId)
+    fun review(assetId: String, keep: Boolean) = viewModelScope.launch { logic.review(assetId, keep) }
+    fun reviewAllPassed() = logic.reviewAllPassed()
+    /** v1.9.10：编辑弹窗写回 LLM 扩写结果（空文本=清空扩写、回到裸词）。内存+DB 双写（持久化在 AssetsLogic 内）。 */
+    suspend fun setEnrichedPrompt(assetId: String, text: String) = logic.setEnrichedPrompt(assetId, text)
+
+    // ==================== 第九轮 QualityEngine 接线 ====================
+
+    /**
+     * B. 角色参考图套装（v1.7.20，取代旧的 6 姿态资产包）：为某角色母卡生成 4 张**彼此独立**
+     * 的参考图（front_bust 基准锁脸 / side_45_right 45° 右前 / profile_side 正侧面 /
+     * front_full_body 正面全身），每张带中英双语构图指令与通用硬性规范，并落库 + 触发生成。
+     *
+     * 每张各自成图、绝不拼图：视频模型对拼图 / 多小人识别失败，会直接搞废锁脸。
+     *
+     * 异步执行，无返回值：实际工作在 viewModelScope.launch 里，返回时任务还没跑完，
+     * 与真实新增数量无关；调用点也只当点击回调用，故签名用 Unit，不再说谎。
+     */
+    fun buildCharacterReferenceSheet(characterId: String) {
+        viewModelScope.launch {
+            var seq = 0
+            logic.buildReferenceSheet(characterId) { "ref_${System.currentTimeMillis()}_${seq++}" }
+            for (child in logic.referenceChildrenOf(characterId)) {
+                val asset = com.dramafactory.app.data.AssetEntity(
+                        asset_id = child.assetId, project_id = projectId, kind = "character",
+                        parent_id = child.parentId, pose_role = child.poseRole,
+                        prompt = child.prompt, updated_at = System.currentTimeMillis())
+                com.dramafactory.app.data.PersistenceActionExecutor.writeAsset(
+                    AppGraph.dao, AppGraph.storageGuard, asset, "build_pose_pack")
+                AppGraph.backgroundScope.launch { logic.generate(child.assetId) }
+            }
+        }
+    }
+
+    /** C. 时代红线：设置本集允许出现的跨时代器物清单（按剧集放行）。 */
+    fun setEpisodeAllowedCrossEra(allowed: List<String>) = viewModelScope.launch {
+        _allowedCrossEra.value = allowed
+        val json = "[" + allowed.joinToString(",") { "\"$it\"" } + "]"
+        withContext(Dispatchers.IO) {
+            AppGraph.dao.setEpisodeAllowedCrossEra("${projectId}_ep1", json)
+            check(AppGraph.dao.episodeAllowedCrossEra("${projectId}_ep1") == json) { "跨时代设置写入后读回不一致" }
+        }
+    }
+
+    // 注：原 `fun episodeAllowedCrossEra(): List<String>` 已删除——全仓无调用点（UI 走
+    // allowedCrossEra StateFlow），且内部用 runBlocking 同步查库，一旦被误用就是主线程 IO。
+    // 时代红线读取请统一走 allowedCrossEra。
+
+    // ==================== 第六轮：本地上传 / 图生图 / 视频参考 ====================
+
+    /**
+     * 本地上传资产落库：三类来源（拍摄/相册图/相册视频）统一经 addLocalAsset 建卡，
+     * 并持久化到 assets 表（source=local + image_uri/video_uri + prompt）。
+     * @param imageUri 图片URI（相册图/拍摄）；null 表示视频上传
+     * @param videoUri 视频URI（相册视频/拍摄）；null 表示图片上传
+     * @param prompt   可选描述
+     * @return 新建资产id（空=无URI失败）
+     */
+    fun uploadLocal(imageUri: String?, videoUri: String?, prompt: String = ""): String {
+        val id = "local_${System.currentTimeMillis()}_${(imageUri ?: videoUri).hashCode()}"
+        val created = logic.addLocalAsset(id, imageUri = imageUri, videoUri = videoUri, prompt = prompt)
+        if (created.isBlank()) return ""
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                // 先 upsert 整行（INSERT OR REPLACE：行不存在也能建卡），再局部UPDATE落URI——
+                // 纯 UPDATE 在行不存在时静默无操作，导致本地上传资产永不持久化（真机刷新即丢）。
+                val promptText = prompt.ifBlank { logic.assets.value.firstOrNull { it.assetId == created }?.prompt } ?: ""
+                com.dramafactory.app.data.PersistenceActionExecutor.writeAsset(AppGraph.dao, AppGraph.storageGuard,
+                    com.dramafactory.app.data.AssetEntity(
+                    asset_id = created, project_id = projectId, kind = "local",
+                    prompt = promptText, updated_at = System.currentTimeMillis()), "asset.local")
+                com.dramafactory.app.data.PersistenceActionExecutor.updateAssetLocalVerified(
+                    AppGraph.dao, AppGraph.storageGuard,
+                    com.dramafactory.app.data.AssetEntity(
+                        asset_id = created, project_id = projectId, kind = "local",
+                        prompt = promptText, updated_at = System.currentTimeMillis()),
+                    "asset.local", "local", imageUri, videoUri, null, promptText)
+            }
+        }
+        return created
+    }
+
+    /** 设置/清除图生图参考图（并持久化） */
+    fun setReferenceImage(assetId: String, uri: String?) = viewModelScope.launch {
+        logic.setReferenceImage(assetId, uri)
+        withContext(Dispatchers.IO) {
+            AppGraph.dao.setAssetReferenceImage(assetId, uri, System.currentTimeMillis())
+        }
+    }
+
+    /**
+     * 第十一轮：编辑资产——上传参考图到资产（相册选图→拷内部目录→设为该资产的参考图）。
+     * 任何资产均可挂参考图（角色DNA锁定/场景风格统一），不再限于本地LOCAL卡。
+     * @return 内部稳定URI；null=拷贝失败
+     */
+    fun uploadReferenceImage(assetId: String, pickedUri: android.net.Uri, onDone: (String?) -> Unit) =
+        viewModelScope.launch {
+            val ctx = AppGraph.appContext() ?: run { onDone(null); return@launch }
+            val internal = runCatching {
+                com.dramafactory.app.ui.AssetFiles.copyToInternal(ctx, pickedUri, isVideo = false)
+            }.getOrNull()
+            if (internal != null) setReferenceImage(assetId, internal)
+            onDone(internal)
+        }
+
+    /** 第十一轮：编辑资产描述并落库；changed=true 时提示重新生成。onResult 为挂起 lambda（可内部调 setEnrichedPrompt 等） */
+    fun editAsset(assetId: String, newPrompt: String, onResult: suspend (Boolean) -> Unit) = viewModelScope.launch {
+        val changed = logic.editAsset(assetId, newPrompt)
+        if (changed) {
+            withContext(Dispatchers.IO) {
+                AppGraph.storageGuard.requireReady()
+                AppGraph.dao.updateAssetPrompt(assetId, newPrompt.trim(), System.currentTimeMillis())
+            }
+        }
+        onResult(changed)
+    }
+}

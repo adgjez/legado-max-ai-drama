@@ -1,0 +1,206 @@
+package com.dramafactory.app.ui
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.dramafactory.app.AppGraph
+import com.dramafactory.app.data.PersistenceActionExecutor
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+/**
+ * 第十轮：分镜页 ViewModel——AI编剧+导演一键生成分镜。
+ *
+ * 流程：读本集剧本 → AiStoryboardDirector.generate（拆镜+视觉指令）→
+ * 台词逐字粗校验 → 落 shots 表（visual_prompt/duration_seconds）→ UI 展示。
+ * 重新生成会先清空本集旧镜（render_tasks 历史保留对账）。
+ */
+class StoryboardViewModel(private val episodeId: String) : ViewModel() {
+
+    data class UiState(
+        val shots: List<com.dramafactory.app.data.ShotEntity> = emptyList(),
+        val generating: Boolean = false,
+        val message: String? = null,
+        /** 第十三轮：shotId → 已出产视频本地路径（COMPLETED且有文件） */
+        val videoUris: Map<String, String> = emptyMap(),
+        /** v1.7.17：assetId → 显示名，供分镜卡片展示「本镜引用了哪些资产」 */
+        val assetNames: Map<String, String> = emptyMap(),
+        /** v1.9.2：assetId → 缩略图 URI（remote_url 或本地 image_uri），分镜详情弹窗展示引用资产 */
+        val assetThumbs: Map<String, String> = emptyMap(),
+    )
+
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> get() = _state
+
+    init { refresh() }
+
+    fun refresh() = viewModelScope.launch {
+        val rows = runCatching { withContext(Dispatchers.IO) { AppGraph.dao.shotsOf(episodeId) } }
+            .getOrDefault(emptyList())
+        // 第十三轮：拉已出产视频（COMPLETED 且本地文件存在）
+        val vids = runCatching {
+            withContext(Dispatchers.IO) { AppGraph.dao.renderStatesOf(episodeId) }
+        }.getOrDefault(emptyList())
+            .filter { it.state == "COMPLETED" && !it.localFileUri.isNullOrBlank() }
+            .associate { it.shotId to it.localFileUri!! }
+        // v1.7.17：构建 assetId → 显示名，让分镜页能直接看出每镜引用了哪些资产
+        // v1.9.2：同时构建 assetId → 缩略图 URI，分镜详情弹窗展示引用资产长相
+        val assetRows = runCatching {
+            withContext(Dispatchers.IO) {
+                val pid = episodeId.substringBeforeLast("_ep")
+                AppGraph.dao.assetsAllOf(pid)
+            }
+        }.getOrDefault(emptyList())
+        val names = assetRows.associate { it.asset_id to AssetCatalog.displayName(it.prompt) }
+        val thumbs = assetRows.mapNotNull { e ->
+            val uri = e.remote_url ?: e.image_uri
+            if (uri.isNullOrBlank()) null else e.asset_id to uri
+        }.toMap()
+        _state.value = _state.value.copy(shots = rows, videoUris = vids,
+            assetNames = names, assetThumbs = thumbs)
+    }
+
+    /** AI 一键生成分镜（LLM 不可用时提示） */
+    fun generateWithAi() = viewModelScope.launch {
+        _state.value = _state.value.copy(generating = true, message = "AI 编剧正在拆解剧本…")
+        val script = runCatching {
+            withContext(Dispatchers.IO) { AppGraph.dao.episode(episodeId)?.script_json }
+        }.getOrNull()
+        if (script.isNullOrBlank()) {
+            _state.value = _state.value.copy(generating = false,
+                message = "本集没有剧本文本。请回项目导入剧本，或到资产页粘贴。")
+            return@launch
+        }
+        // LLM 前置判断：引擎未就绪/key 未配置不发起网络
+        // v1.9.13：改用 hasVideoKey()，覆盖 custom-video/custom-image/agnes-* 多槽位，与运行时一致。
+        val llmReady = AppGraph.isInitialized && AppGraph.hasVideoKey()
+        if (!llmReady) {
+            _state.value = _state.value.copy(generating = false,
+                message = "未配置 API Key，无法使用AI生成分镜。请到「设置」页配置后重试。")
+            return@launch
+        }
+
+        // 第十五轮：拉项目资产注入 LLM 提示词，让分镜用 asset_id 引用真资产。
+        // v1.7.17：改走 AssetCatalog.build —— 只给母卡、只给已有图的卡，
+        // 否则 LLM 会引用 参考图子卡（侧脸/怒容）或未生图的空卡，渲染时静默失锁。
+        val projectId = episodeId.substringBeforeLast("_ep")
+        val assets = runCatching {
+            withContext(Dispatchers.IO) { AppGraph.dao.assetsAllOf(projectId) }
+        }.getOrDefault(emptyList())
+        val catalog = AssetCatalog.build(assets)
+        // v1.9.17：诊断用统计——区分「项目没资产卡」/「有卡但没生图」/「LLM 幻觉 id」三种根因
+        val motherCards = assets.filter { it.parent_id.isNullOrBlank() && it.pose_role.isNullOrBlank() }
+        val mothersWithImage = motherCards.count {
+            !it.remote_url.isNullOrBlank() || !it.image_uri.isNullOrBlank()
+        }
+        val result = runCatching {
+            com.dramafactory.core.quality.AiStoryboardDirector.generate(
+                script, chat = { req -> AppGraph.text.chat(req) }, assets = catalog)
+        }.getOrElse {
+            _state.value = _state.value.copy(generating = false,
+                message = "AI 生成分镜失败：${it.message ?: it.javaClass.simpleName}")
+            return@launch
+        }
+        if (result.shots.isEmpty()) {
+            _state.value = _state.value.copy(generating = false, message = "AI未能从剧本拆出镜头，请检查剧本内容后重试")
+            return@launch
+        }
+
+        val entities = result.shots.map { s -> com.dramafactory.app.data.ShotEntity(
+            shot_id = "${episodeId}_shot${s.shotNo}",
+            episode_id = episodeId, project_id = projectId, shot_no = s.shotNo,
+            dialogue = s.dialogue, narration = s.narration,
+            action = listOfNotNull(s.action, s.visualPrompt?.let { "［$it］" }).joinToString("；"),
+            beat_ref = s.beatRef, carry_over = s.carryOver, scene_context = s.sceneContext,
+            first_asset_ids = AssetCatalog.encodeRefIds(s.assetIds), last_asset_ids = "[]",
+            visual_prompt = s.visualPrompt, duration_seconds = s.durationSeconds,
+            sb_check = if (result.gateErrors[s.shotNo].isNullOrEmpty()) "pass" else "error:${result.gateErrors[s.shotNo]!!.joinToString(",")}",
+        ) }
+        try {
+            PersistenceActionExecutor.writeShotsBatch(AppGraph.dao, AppGraph.storageGuard, episodeId, entities, "storyboard.generate")
+        } catch (e: Throwable) {
+            _state.value = _state.value.copy(generating = false, message = "分镜保存失败：${e.message ?: e.javaClass.simpleName}")
+            return@launch
+        }
+        refresh()
+        val errCount = result.gateErrors.size
+        // v1.9.17：用 refStats 精确定位「分镜没引用资产」断在哪一环，不再只给一句笼统警告
+        val st = result.refStats
+        val noAssetNote = when {
+            st.catalogSize == 0 && motherCards.isEmpty() ->
+                "。⚠ 本项目还没有任何资产卡，分镜未引用资产"
+            st.catalogSize == 0 && mothersWithImage == 0 ->
+                "。⚠ 你有 ${motherCards.size} 个资产卡，但**一个图都没生成**——资产目录为空，分镜无法引用任何资产。请先到资产页把资产图生成出来，再重生成分镜"
+            st.catalogSize == 0 ->
+                "。⚠ 资产目录为空（${motherCards.size} 个母卡中仅 $mothersWithImage 个有图且均未过审进目录），分镜未引用资产"
+            st.keptRefs == 0 && st.rawRefs == 0 ->
+                "。⚠ 目录有 ${st.catalogSize} 项，但 LLM 没有输出任何 asset_ids（指令未跟随）"
+            st.keptRefs == 0 && st.rawRefs > 0 ->
+                "。⚠ LLM 引用了 ${st.rawRefs} 个资产 id，但**都不在目录内**（目录 ${st.catalogSize} 项）→ 已丢弃 ${st.droppedRefs} 个幻觉 id"
+            st.keptRefs > 0 ->
+                " · 已引用资产 ${st.keptRefs} 次（目录 ${st.catalogSize} 项）" +
+                    (if (st.droppedRefs > 0) "，⚠ 丢弃 ${st.droppedRefs} 个不在目录的 id" else "")
+            else -> ""
+        }
+        _state.value = _state.value.copy(generating = false, message =
+            "已生成${result.shots.size}镜" + (if (errCount > 0) "（其中${errCount}镜校验有误，见列表标记）" else "，全部通过校验✓") + noAssetNote)
+    }
+
+    fun clearMessage() { _state.value = _state.value.copy(message = null) }
+
+    // ---- 第十二轮：分镜可操作（编辑/删除/渲染）----
+
+    /** 编辑单镜并落库；action与visual_prompt分开存，UI展示时合并 */
+    fun updateShot(
+        shotId: String, action: String, dialogue: String?, narration: String?,
+        visualPrompt: String?, durationSeconds: Double,
+    ) = viewModelScope.launch {
+        val failure = runCatching {
+            withContext(Dispatchers.IO) {
+                val row = AppGraph.dao.shotKeyframes(shotId)
+                    ?: error("找不到分镜：$shotId")
+                AppGraph.dao.upsertShot(row.copy(
+                    action = action.trim(), dialogue = dialogue?.trim()?.ifBlank { null },
+                    narration = narration?.trim()?.ifBlank { null }, visual_prompt = visualPrompt?.trim()?.ifBlank { null },
+                    duration_seconds = durationSeconds.coerceIn(1.0, 60.0)))
+                val back = AppGraph.dao.shotKeyframes(shotId)
+                check(back?.action == action.trim()) { "分镜编辑后读回不一致：$shotId" }
+            }
+        }.exceptionOrNull()
+        refresh()
+        _state.value = _state.value.copy(message = failure?.let { "保存分镜失败：${it.message}" } ?: "已保存镜头修改✓")
+    }
+
+    /** 删除单镜 */
+    fun deleteShot(shotId: String) = viewModelScope.launch {
+        val failure = runCatching {
+            withContext(Dispatchers.IO) {
+                AppGraph.dao.deleteShot(shotId)
+                check(AppGraph.dao.shotKeyframes(shotId) == null) { "分镜删除后仍可读回：$shotId" }
+            }
+        }.exceptionOrNull()
+        refresh()
+        if (failure != null) _state.value = _state.value.copy(message = "删除分镜失败：${failure.message}")
+    }
+
+    /**
+     * 第十二轮：把本集全部分镜入队渲染（复用渲染队列断点续传/预算熔断链路）。
+     */
+    fun enqueueRender(onQueued: (Int) -> Unit) = viewModelScope.launch {
+        val shots = _state.value.shots
+        if (shots.isEmpty()) { onQueued(0); return@launch }
+        val queue = RenderRuntime.queueFor(episodeId)
+        val metas: List<com.dramafactory.core.model.ShotMeta> = shots.map { row ->
+            val visual: String = row.visual_prompt?.let { "[$it]" } ?: ""
+            val dlg: String = row.dialogue?.let { "「$it」" } ?: ""
+            com.dramafactory.core.model.ShotMeta(
+                shotId = row.shot_id, episodeId = episodeId,
+                prompt = "$dlg${row.action ?: ""}$visual")
+        }
+        runCatching { queue.enqueueEpisode(episodeId, metas) }
+            .onSuccess { onQueued(metas.size) }
+            .onFailure { _state.value = _state.value.copy(message = "入队失败：${it.message}") }
+    }
+}

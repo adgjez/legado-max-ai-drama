@@ -1,0 +1,780 @@
+package com.dramafactory.core.provider
+
+import com.dramafactory.core.model.ChatMessage
+import com.dramafactory.core.model.ChatRequest
+import com.dramafactory.core.model.ChatResponse
+import com.dramafactory.core.model.ConnectionInfo
+import com.dramafactory.core.model.ImageGenRequest
+import com.dramafactory.core.model.ModelSpec
+import com.dramafactory.core.model.PollResult
+import com.dramafactory.core.model.ProviderError
+import com.dramafactory.core.model.VideoSubmitRequest
+import com.dramafactory.core.pipeline.DefaultRateGate
+import io.ktor.client.HttpClient
+import io.ktor.client.request.get
+import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
+import io.ktor.http.HttpHeaders
+import io.ktor.http.contentType
+import io.ktor.utils.io.readRemaining
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.put
+import kotlin.math.roundToInt
+
+/**
+ * Agnes 服务站点（网关地域）。
+ * - INTERNATIONAL：官方国际站 apihub.agnes-ai.com（默认）
+ * - CHINA：中国站 api.agnes-ai.cn（国内可达，覆盖文本/视频/图像全部官方网关）
+ */
+enum class AgnesRegion { INTERNATIONAL, CHINA }
+
+/**
+ * AgnesVideoAdapter —— Agnes/PavoAPI 三通道适配器（语义对齐 agnes_client.py v0.9.4+）。
+ *
+ * 实战继承要点（架构§4）：
+ * 1. submitVideo 第一行过 120s 限速门；
+ * 2. 429 从HTTP层立即抛 QuotaError，视频提交外层专用长退避 base=30s cap=180s 最多3次；
+ * 5xx 走指数退避（2s×2^n ≤3次）；
+ * 3. 参数前置校验：num_frames 归一 8n+1 且≤441；宽高取64倍数；frame_rate∈[1,60]；
+ * 4. keyframes 双帧必须同时传 image=[first,last] + mode="keyframes"；
+ * 5. 中文配音指令注入（决议Q9）+ generate_audio=true/audio=true；
+ * 6. 文本通道 enable_thinking=false；JSON解析3次退避重试由调用方处理；
+ * 7. 日志脱敏：Key 掩码（前3后3）、响应体截断。
+ */
+class AgnesProvider(
+    private val rateGate: DefaultRateGate = DefaultRateGate(),
+    /** 明文Key来源：生产为KeyVault.load()，测试注入假实现。仅进Authorization header */
+    var apiKeyProvider: suspend () -> String = { "" },
+    // 默认走进程级共享客户端：Provider 是按次创建的，逐次 new HttpClient 会泄漏连接池
+    private val client: HttpClient = SharedHttp.client,
+    /** 可注入时钟/睡眠以便JVM测试时序断言 */
+    private val sleeper: suspend (Long) -> Unit = { kotlinx.coroutines.delay(it) },
+    // ---- v1.7.18：自定义模型覆盖（OpenAI 兼容供应商）。null=走 Agnes 官方地址/模型 ----
+    /** 自定义 base_url（如 https://api.example.com/v1），覆盖默认 Agnes 网关 */
+    private val baseUrlOverride: String? = null,
+    /** 自定义视频模型 id，覆盖默认 agnes-video-v2.0 */
+    private val videoModelOverride: String? = null,
+    /** 自动选型不固定模型；true 时每次根据输入参数选择可用模型 */
+    private val autoSelectVideoModel: Boolean = false,
+    /** 自定义图像模型 id，覆盖默认 agnes-image-2.1-flash */
+    private val imageModelOverride: String? = null,
+    /** v1.8.8：服务站点。CHINA 时全部网关走中国站（覆盖 baseUrlOverride 之外的官方端点） */
+    private val region: AgnesRegion = AgnesRegion.INTERNATIONAL,
+) : VideoProvider, TextProvider, ImageProvider {
+
+    private val effectiveBaseUrl: String get() = when {
+        // 显式自定义模型优先（自定义供应商不走官方 Agnes 地域）
+        baseUrlOverride != null -> baseUrlOverride.trimEnd('/').takeIf { it.isNotBlank() } ?: BASE_URL
+        region == AgnesRegion.CHINA -> BASE_URL_CN
+        else -> BASE_URL
+    }
+    /** 测试可见：当前生效的网关 base（便于校验 region / 自定义 override 解析） */
+    internal val resolvedBaseUrl: String get() = effectiveBaseUrl
+    private val effectiveVideoModel: String get() = videoModelOverride?.trim()?.takeIf { it.isNotBlank() && it != "auto" } ?: MODEL_VIDEO
+    private val effectiveImageModel: String get() = imageModelOverride?.trim()?.takeIf { it.isNotBlank() } ?: MODEL_IMAGE
+
+    /** P1-1：验证期间的候选Key通道（null=用常规apiKeyProvider） */
+    class ValidatingKeyContext(val candidateKey: String) : AbstractCoroutineContextElement(ValidatingKeyContext) {
+        companion object Key : CoroutineContext.Key<ValidatingKeyContext>
+    }
+
+    /** P1-1：per-call取Key——优先协程上下文中的验证Key，否则常规来源。并发请求互不干扰 */
+    private suspend fun currentApiKey(): String =
+        kotlinx.coroutines.currentCoroutineContext()[ValidatingKeyContext]?.candidateKey ?: apiKeyProvider()
+
+    companion object {
+        const val BASE_URL = "https://apihub.agnes-ai.com/v1"
+        const val VIDEO_RESULT_URL = "https://apihub.agnes-ai.com/agnesapi" // ?video_id=...
+        /** v1.8.8：中国站网关（官方国内镜像，覆盖文本/视频/图像全部官方端点） */
+        const val BASE_URL_CN = "https://api.agnes-ai.cn/v1"
+        const val VIDEO_RESULT_URL_CN = "https://api.agnes-ai.cn/agnesapi" // ?video_id=...
+        const val MODEL_TEXT = "agnes-3.0-flash"
+        const val MODEL_TEXT_MID = "agnes-2.5-flash"     // 中等输入降级
+        const val MODEL_TEXT_LIGHT = "agnes-2.0-flash"   // 大输入安全降级
+        /** 第十轮：熔断阈值——估算token超过此值不发API（官方上限512K，预留输出） */
+        const val TEXT_INPUT_TOKEN_LIMIT = 230_000L
+
+        /**
+         * 按输入规模自动选型（第十轮「自动选择对应模型」）：
+         * 中文≈1字符1token、ASCII≈4字符1token 的保守估算。
+         * <100K → agnes-3.0-flash（最新默认模型）
+         * <200K → agnes-2.5-flash（中等输入降级）
+         * <230K → agnes-2.0-flash（大输入安全降级）
+         * ≥230K → 熔断抛 ValidationError，绝不发必爆请求
+         */
+        fun estimateTokens(text: String): Long {
+            var cjk = 0L
+            for (c in text) if (c.code > 0x2E80) cjk++
+            return cjk + (text.length - cjk) / 4
+        }
+
+        fun pickTextModel(req: ChatRequest): String {
+            val total = req.messages.sumOf { estimateTokens(it.content) + (it.imageUrl?.let { u -> estimateTokens(u) / 3 } ?: 0L) }
+            if (total >= TEXT_INPUT_TOKEN_LIMIT)
+                throw ProviderError.ValidationError(
+                    "context overload: ~${total}K tokens exceeds ${TEXT_INPUT_TOKEN_LIMIT / 1000}K safe limit; 请精简输入或缩小图片")
+            return when {
+                total < 100_000 -> MODEL_TEXT
+                total < 200_000 -> MODEL_TEXT_MID
+                else -> MODEL_TEXT_LIGHT
+            }
+        }
+        const val MODEL_IMAGE = "agnes-image-2.1-flash"
+        const val MODEL_VIDEO = "agnes-video-v2.0"
+
+        /**
+         * 按实际输入复杂度自动选择 Agnes 视频模型。
+         * 空偏好=自动：纯文生/最多5张图片优先 Flash；超过5张图片或带参考视频切 2.5。
+         * 中国站当前不暴露 2.5，自动模式退回 v2.0；用户明确指定模型时尊重指定值。
+         */
+        fun pickVideoModel(
+            preferredModel: String?,
+            imageCount: Int,
+            hasReferenceVideo: Boolean,
+            region: AgnesRegion,
+        ): String {
+            val preferred = preferredModel?.trim().orEmpty()
+            if (preferred.isNotBlank() && preferred != "auto") return preferred
+            if (region == AgnesRegion.CHINA) return MODEL_VIDEO
+            return if (hasReferenceVideo || imageCount > 5) "agnes-video-2.5" else "agnes-video-2.5-flash"
+        }
+
+
+        const val MAX_NUM_FRAMES = 441
+        const val NUM_FRAMES_MOD = 8      // 必须 8n+1
+        const val DIMENSION_MULTIPLE = 64 // 宽高必须64的倍数
+
+        // 视频提交长退避参数（对齐pavo VIDEO_SUBMIT_BACKOFF_*）
+        const val SUBMIT_BACKOFF_BASE_MS = 30_000L
+        const val SUBMIT_BACKOFF_CAP_MS = 180_000L
+        const val SUBMIT_MAX_ATTEMPTS = 3
+        const val HTTP_MAX_RETRIES = 3
+        const val INITIAL_BACKOFF_MS = 2_000L
+        // AI 助手对话的 /chat/completions 上游偶发 503，重试需要更耐心：
+        // 5 次 × 指数退避 3s 起步 ≈ 3+6+12+24 = 45s 总等待上限。
+        const val CHAT_MAX_RETRIES = 5
+        const val CHAT_INITIAL_BACKOFF_MS = 3_000L
+
+        // pavo _mask_key 语义移植：前3后3
+        fun maskKey(k: String): String =
+            when { k.isEmpty() -> "<empty>"; k.length <= 8 -> "***"; else -> "${k.take(3)}***${k.takeLast(3)}" }
+
+        /**
+         * v1.9.15：不同视频模型对 image 输入张数的上限不同。
+         * Agnes 官方 agnes-video-v2.0 支持 keyframes（2张）+ 参考图；
+         * ti2vid / 部分第三方模型只支持 1 张 image。按 model id 白名单控制。
+         */
+        fun modelMaxInputImages(modelId: String): Int = when {
+            modelId.contains("ti2vid", ignoreCase = true) -> 1
+            modelId.contains("i2v", ignoreCase = true) -> 1
+            modelId.contains("cogvideox", ignoreCase = true) -> 1
+            else -> 8   // Agnes 官方 agnes-video-v2.0 及同代模型：首帧+尾帧+参考图兜底
+        }
+
+        /**
+         * v1.9.16：Agnes 视频模型家族识别（决定提交 payload 形态）。
+         * 2.5 系列走 reference 模式（首帧 image 字符串 + reference_images 独立数组，最多5张）；
+         * ti2vid 走单帧字符串 image；其余（v2.0 及同代）走 image 数组 + keyframes。
+         */
+        fun isAgnesVideo25(modelId: String): Boolean =
+            modelId.contains("video-2.5", ignoreCase = true) ||
+            modelId.contains("2.5-flash", ignoreCase = true)
+        fun isTi2vid(modelId: String): Boolean = modelId.contains("ti2vid", ignoreCase = true)
+
+        /** v1.9.27：2.5 系列 num_frames/frame_rate → seconds 字符串（官方仅收 "4"–"12"，默认"5"） */
+        fun video25Seconds(numFrames: Int, frameRate: Float): String =
+            (numFrames / maxOf(1f, frameRate)).roundToInt().coerceIn(4, 12).toString()
+
+        /** v1.9.27：2.5 宽高 → 官方画幅白名单（9:16 / 16:9 / 1:1，默认 16:9） */
+        fun video25AspectRatio(w: Int, h: Int): String = when {
+            w >= h * 1.2 -> "16:9"
+            h >= w * 1.2 -> "9:16"
+            else -> "1:1"
+        }
+
+        /** v1.9.27：2.5 reference 模式 images 上限——flash 5 张（超出 400），2.5 官方 8 张 */
+        fun video25MaxImages(modelId: String): Int =
+            if (modelId.contains("flash", ignoreCase = true)) 5 else 8
+
+        /** num_frames 归一到最近的 8n+1，clamp到[1,441]（对齐closest_valid_num_frames） */
+        fun closestValidNumFrames(target: Int): Int {
+            if (target <= 1) return 1
+            val capped = minOf(target, MAX_NUM_FRAMES)
+            val n = Math.round((capped - 1).toDouble() / NUM_FRAMES_MOD).toInt()
+            return NUM_FRAMES_MOD * n + 1
+        }
+
+        /** 尺寸归一到64的倍数（≥64），向下取整（对齐closest_valid_dimension） */
+        fun closestValidDimension(target: Int): Int {
+            if (target <= 0) return DIMENSION_MULTIPLE
+            return maxOf(DIMENSION_MULTIPLE, target / DIMENSION_MULTIPLE * DIMENSION_MULTIPLE)
+        }
+    }
+
+    override val id: String = "agnes"
+
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /**
+     * v1.9.23：Agnes 的 error 字段经常是 JSON 字符串再套 JSON 字符串（如 pollResult 返回
+     * {"error": "{\"error\":{\"message\":\"ti2vid supports at most 1 image\"}}"}），直接 toString()
+     * 会露出转义堆栈。递归提取最内层 message，给用户看一句人话。
+     */
+    private fun extractReadableError(raw: String): String {
+        var current = raw.trim()
+        // 去除 HTTP 状态码前缀如 "400: "、"422: "
+        current = current.replace(Regex("""^\d{3}:\s*"""), "")
+        repeat(4) {
+            val trimmed = current.trim()
+            current = when {
+                trimmed.startsWith("{") || trimmed.startsWith("[") -> {
+                    try {
+                        val el = json.parseToJsonElement(trimmed)
+                        val next = when (el) {
+                            is JsonObject -> el["message"]?.jsonPrimitive?.contentOrNull
+                                ?: el["error"]?.let { e ->
+                                    when (e) {
+                                        is JsonObject -> e["message"]?.jsonPrimitive?.contentOrNull
+                                        is JsonPrimitive -> e.contentOrNull
+                                        else -> null
+                                    }
+                                }
+                            else -> null
+                        }
+                        if (next.isNullOrBlank()) return@extractReadableError trimmed else next
+                    } catch (_: Exception) { return@extractReadableError raw.trim() }
+                }
+                trimmed.startsWith("\"") && trimmed.endsWith("\"") -> {
+                    try {
+                        json.parseToJsonElement(trimmed).jsonPrimitive.content
+                    } catch (_: Exception) { return@extractReadableError raw.trim() }
+                }
+                else -> return@extractReadableError trimmed
+            }
+        }
+        return current.trim().take(300)
+    }
+
+    // ------------------------------------------------------------------
+    // 低层HTTP：POST/GET 带可重试状态分类（对齐_post_json/_get_json）
+    // 注意：429 在此层立即抛 QuotaError，绝不HTTP层快重试——
+    //       视频提交的长退避在外层循环处理。
+    // ------------------------------------------------------------------
+    private suspend fun postJson(
+        path: String,
+        body: JsonObject,
+        maxRetries: Int = HTTP_MAX_RETRIES,
+        initialBackoffMs: Long = INITIAL_BACKOFF_MS,
+    ): JsonObject {
+        var backoff = initialBackoffMs
+        var lastErr: Exception? = null
+        for (attempt in 0 until maxRetries) {
+            try {
+                val resp = client.post("$effectiveBaseUrl$path") {
+                    contentType(ContentType.Application.Json)
+                    header(HttpHeaders.Authorization, "Bearer ${currentApiKey()}")
+                    setBody(body.toString())
+                }
+                return when {
+                    resp.status.value == 200 || resp.status.value == 201 ->
+                        json.parseToJsonElement(resp.bodyAsText().ifEmpty { "{}" }).jsonObject
+                    resp.status.value == 429 ->
+                        throw ProviderError.QuotaError("429 Too Many Requests: ${resp.snip()}")
+                    resp.status.value == 401 ->
+                        throw ProviderError.AuthError("401 Unauthorized: ${resp.snip()}")
+                    resp.status.value == 400 || resp.status.value == 422 ->
+                        throw ProviderError.ValidationError("${resp.status.value}: ${resp.snip()}")
+                    resp.isRetryable() -> {
+                        val body = resp.snip()
+                        if (body.contains("model_not_found", ignoreCase = true) ||
+                            body.contains("No available channel", ignoreCase = true)) {
+                            throw ProviderError.ValidationError("${resp.status.value}: 视频模型不可用，请在设置中更换模型或渠道：$body")
+                        }
+                        lastErr = ProviderError.TransientError("HTTP ${resp.status.value} retryable: $body", retryable = true)
+                        sleeper(backoff); backoff *= 2
+                        continue
+                    }
+                    else -> throw ProviderError.TransientError("HTTP ${resp.status.value}: ${resp.snip()}")
+                }
+            } catch (e: java.io.IOException) {
+                // 网络瞬断：指数退避重试（ProviderError不在此列，直接上抛）
+                // v1.6.7 改进：把 lastErr 的可读信息（类名+message）累加到 reasons
+                lastErr = e
+                val reason = "${e.javaClass.simpleName}: ${e.message?.take(120) ?: ""}"
+                // core-engine 不能依赖 app 模块的 CrashLog，只 println（Android logcat 可见）
+                println("AgnesProvider postJson[$path] attempt=${attempt + 1}/$maxRetries $reason")
+                if (attempt == maxRetries - 1) break
+                sleeper(backoff); backoff *= 2
+            }
+        }
+        // v1.6.7 改进：toString() 太长被 FQN 截断，改用类名+message
+        val errInfo = if (lastErr != null) {
+            "${lastErr!!.javaClass.simpleName}: ${lastErr!!.message?.take(120) ?: ""}"
+        } else "no error captured"
+        throw ProviderError.TransientError("giving up on $path after $maxRetries attempts: $errInfo")
+    }
+
+    private suspend fun getJson(url: String): JsonObject {
+        var backoff = INITIAL_BACKOFF_MS
+        var lastErr: Exception? = null
+        for (attempt in 0 until HTTP_MAX_RETRIES) {
+            try {
+                val resp = client.get(url) {
+                    header(HttpHeaders.Authorization, "Bearer ${currentApiKey()}")
+                }
+                return when {
+                    resp.status.value == 200 ->
+                        json.parseToJsonElement(resp.bodyAsText().ifEmpty { "{}" }).jsonObject
+                    resp.status.value == 429 ->
+                        throw ProviderError.QuotaError("429 Too Many Requests: ${resp.snip()}")
+                    resp.status.value == 401 ->
+                        throw ProviderError.AuthError("401 Unauthorized: ${resp.snip()}")
+                    resp.isRetryable() -> {
+                        lastErr = ProviderError.TransientError("HTTP ${resp.status.value} retryable", retryable = true)
+                        sleeper(backoff); backoff *= 2
+                        continue
+                    }
+                    else -> throw ProviderError.TransientError("HTTP ${resp.status.value}: ${resp.snip()}")
+                }
+            } catch (e: java.io.IOException) {
+                lastErr = e
+                if (attempt == HTTP_MAX_RETRIES - 1) break
+                sleeper(backoff); backoff *= 2
+            }
+        }
+        throw ProviderError.TransientError("giving up on GET after $HTTP_MAX_RETRIES attempts: $lastErr")
+    }
+
+    private fun HttpResponse.isRetryable(): Boolean =
+        status.value in intArrayOf(408, 500, 502, 503, 504, 520, 522, 524)
+
+    /** 日志脱敏：响应体截断记录（架构§4.9） */
+    private suspend fun HttpResponse.snip(): String = bodyAsText().take(400)
+
+    // ------------------------------------------------------------------
+    // VideoProvider
+    // ------------------------------------------------------------------
+    override suspend fun validateKey(key: String): Result<ConnectionInfo> {
+        // 最小成本请求：1-token chat ping
+        // P1-1：候选Key经协程上下文注入——仅本次验证调用链可见，并发请求零影响
+        return withContext(ValidatingKeyContext(key)) {
+            try {
+                val t0 = System.currentTimeMillis()
+                chat(ChatRequest(messages = listOf(ChatMessage("user", "ping")), maxTokens = 8))
+                Result.success(ConnectionInfo(true, System.currentTimeMillis() - t0, "chat ping ok"))
+            } catch (e: ProviderError.AuthError) {
+                Result.failure(e)
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+
+    override fun listModels(): List<ModelSpec> {
+        // v1.9.16：按地域暴露不同视频模型——cn 站只有 v2.0 且大概率 403，2.5 仅国际站可用
+        val videoModels = when (region) {
+            AgnesRegion.CHINA -> listOf(
+                MODEL_VIDEO to "Agnes 视频 v2.0（国内站，常403）",
+            )
+            AgnesRegion.INTERNATIONAL -> listOf(
+                MODEL_VIDEO to "Agnes 视频 v2.0（旧协议）",
+                "agnes-video-2.5" to "Agnes 视频 2.5（多参数/最多8图+1视频）",
+                "agnes-video-2.5-flash" to "Agnes 视频 2.5 Flash（快速/最多5图/仅720P）",
+            )
+        }
+        return videoModels.map { (id, label) ->
+            ModelSpec(id, label).apply { supportsVideoReference = true }
+        } + listOf(
+            ModelSpec(MODEL_TEXT, "Agnes 文本 3.0 Flash"),
+            ModelSpec(MODEL_IMAGE, "Agnes 图像 2.1 Flash"),
+        )
+    }
+
+    override suspend fun submitVideo(req: VideoSubmitRequest): String {
+        // ① 先过120s限速门再干活（首发免等）
+        rateGate.awaitSlot()
+
+        // v1.9.31：自动选型。用户未固定模型时，根据本镜实际参考参数选择协议：
+        // 纯文生/≤5张图片→2.5 Flash；>5张图片或参考视频→2.5；中国站→v2.0。
+        val modelId = req.modelId?.trim()?.takeIf { it.isNotBlank() }
+        val effectiveVideoModel = if (modelId != null) modelId else if (autoSelectVideoModel) pickVideoModel(
+            preferredModel = videoModelOverride,
+            imageCount = (req.inputImages + listOfNotNull(req.firstImageUri, req.lastImageUri, req.referenceImageUri))
+                .distinct().size,
+            hasReferenceVideo = req.referenceVideoUri != null,
+            region = region,
+        ) else (videoModelOverride?.trim()?.takeIf { it.isNotBlank() && it != "auto" } ?: MODEL_VIDEO)
+
+        // v1.9.16：地域×模型前置校验（省远程 422/403 浪费）
+        // cn 站没有 2.5 模型 id（填了直接 422 模型不存在），也不建议跑 v2.0（大量账号 403）
+        if (region == AgnesRegion.CHINA && isAgnesVideo25(effectiveVideoModel))
+            throw ProviderError.ValidationError("cn 站点不存在 agnes-video-2.5（422 模型不存在）；请切国际站或使用 v2.0")
+
+        // 参数前置校验：本地暴露4xx问题，省远程成本（架构§4.4）
+        if (req.frameRate < 1f || req.frameRate > 60f)
+            throw ProviderError.ValidationError("frame_rate ${req.frameRate} out of range [1,60]")
+        val nf = closestValidNumFrames(req.numFrames)
+        val w = closestValidDimension(req.width)
+        val h = closestValidDimension(req.height)
+
+        // 决议Q9：中文配音指令注入（中文台词主导开头+显式指令追加）
+        val prompt = ChineseAudioInjector.inject(req.prompt)
+
+        // v1.9.27：2.5/2.5-flash 官方独立协议（wiki agnes-video-25）——
+        // 顶层禁止 width/height/fps/num_frames（400 forbidden field），尺寸=size档位+aspect_ratio，时长=seconds。
+
+        val body = buildJsonObject {
+            put("model", effectiveVideoModel)
+
+            if (isAgnesVideo25(effectiveVideoModel)) {
+                // ---- Agnes Video 2.5 / 2.5-flash：官方参数集（mode 必填 + 媒体字段顶层）----
+                put("seconds", video25Seconds(nf, req.frameRate))
+                put("size", "720P")   // flash 仅支持 720P（其他值 400）；2.5 同档保守
+                put("aspect_ratio", video25AspectRatio(w, h))
+                // 模式互斥：首+尾且无资产参考→keyframe（保构图）；有资产参考→reference（锁脸优先）；无图→text
+                val extraRefs = req.inputImages.filter { it != req.firstImageUri && it != req.lastImageUri }
+                val refMedia = (listOfNotNull(req.firstImageUri ?: req.referenceImageUri) + req.inputImages).distinct()
+                val maxRefs = video25MaxImages(effectiveVideoModel)
+                when {
+                    req.lastImageUri != null && extraRefs.isEmpty() -> {
+                        put("prompt", prompt)
+                        put("mode", "keyframe")
+                        put("first_frame", req.firstImageUri ?: req.lastImageUri!!)
+                        put("last_frame", req.lastImageUri)
+                    }
+                    refMedia.isNotEmpty() -> {
+                        // <Picture N> 指代 images 数组（从1编号）：首帧=Picture 1 为视觉主体
+                        put("prompt", "画面构图与主体外观以 <Picture 1> 为准，其余图片为角色与风格参考。$prompt")
+                        put("mode", "reference")
+                        val kept = refMedia.take(maxRefs)
+                        put("images", buildJsonArray { kept.forEach { add(JsonPrimitive(it)) } })
+                        // 仅 2.5 支持参考视频（flash 传入 400 videos is not supported）
+                        req.referenceVideoUri?.let { v ->
+                            put("videos", buildJsonArray {
+                                add(buildJsonObject { put("url", v); put("require_audio", false) })
+                            })
+                        }
+                        println("AgnesProvider submitVideo[2.5] reference mode: media=${kept.size}/${refMedia.size} video=${req.referenceVideoUri != null}")
+                    }
+                    req.firstImageUri != null || req.lastImageUri != null -> {
+                        put("prompt", prompt)
+                        put("mode", "keyframe")
+                        req.firstImageUri?.let { put("first_frame", it) }
+                        req.lastImageUri?.let { put("last_frame", it) }
+                    }
+                    req.referenceVideoUri != null -> {
+                        val v = req.referenceVideoUri
+                        put("prompt", prompt)
+                        put("mode", "reference")
+                        put("videos", buildJsonArray {
+                            add(buildJsonObject { put("url", v); put("require_audio", false) })
+                        })
+                    }
+                    else -> {
+                        put("prompt", prompt)
+                        put("mode", "text")
+                    }
+                }
+                // 2.5 协议无 negative_prompt/generate_audio 字段（文档参数集未含，多发字段一律 400）——
+                // 音画协同由 prompt 描述驱动（中文配音指令已注入 prompt）。
+                return@buildJsonObject
+            }
+
+            put("prompt", prompt)
+            put("width", w); put("height", h)
+            put("num_frames", nf); put("frame_rate", req.frameRate.toDouble())
+
+            // v1.9.16：按模型家族组装不同的图像输入协议
+            when {
+                isTi2vid(effectiveVideoModel) -> {
+                    // ti2vid：image 仅字符串（首帧），mode=ti2vid，禁止数组
+                    val first = req.firstImageUri ?: req.referenceImageUri
+                    put("image", first ?: "")
+                    put("mode", "ti2vid")
+                }
+                else -> {
+                    // v2.0 及同代：image 数组（首帧+尾帧+资产参考图），keyframes 模式
+                    val images = mutableListOf<String>()
+                    if (req.firstImageUri != null && req.lastImageUri != null) {
+                        images.add(req.firstImageUri); images.add(req.lastImageUri)
+                    } else if (req.firstImageUri != null) {
+                        images.add(req.firstImageUri)
+                    } else if (req.referenceImageUri != null) {
+                        images.add(req.referenceImageUri)
+                    }
+                    images.addAll(req.inputImages)
+                    val maxImages = modelMaxInputImages(effectiveVideoModel)
+                    val finalImages = images.take(maxImages)
+                    if (finalImages.size < images.size) {
+                        println("AgnesProvider submitVideo[$effectiveVideoModel] image count ${images.size} > max $maxImages; keeping ${finalImages.size}")
+                    }
+                    if (finalImages.isNotEmpty()) {
+                        if (maxImages == 1) {
+                            // v1.9.23：ti2vid / i2v / cogvideox 等只支持单张字符串 image，不要发数组
+                            put("image", finalImages.first())
+                        } else {
+                            put("image", buildJsonArray { finalImages.forEach { add(JsonPrimitive(it)) } })
+                            if (finalImages.size >= 2 && req.firstImageUri != null && req.lastImageUri != null) put("mode", "keyframes")
+                        }
+                    }
+                }
+            }
+
+            // 视频参考输入：部分供应商支持，仅当模型标记支持且提供了URI时填入
+            req.referenceVideoUri?.let { put("reference_video", it) }
+            req.negativePrompt?.let { put("negative_prompt", it) }
+            if (req.generateAudio) {
+                // 原生语音轨=人声+环境音+SFX一体，永不做静音+重配
+                put("generate_audio", true)
+                put("audio", true)
+            }
+        }
+
+        // ② 429长退避不快重试：base=30s cap=180s 最多3次（对齐generate_video外层循环）
+        var backoff = SUBMIT_BACKOFF_BASE_MS
+        repeat(SUBMIT_MAX_ATTEMPTS) { attempt ->
+            try {
+                // maxRetries语义=1：本层不做HTTP快重试，429/5xx全走长退避
+                val out = postJson("/videos", body)
+                val videoId = out["video_id"]?.jsonPrimitive?.content
+                    ?: throw ProviderError.ReconcileRequired(
+                        rawBody = out.toString().take(400),
+                        msg = "2xx but missing video_id; remote task may be billed — reconcile required",
+                    )
+                // 返回providerTaskId；调用方拿到后【立即】落库submitted态
+                // 仅自动/请求级选型需要把实际模型随任务保存，旧固定模型保持原 task id 兼容。
+                return if (autoSelectVideoModel || modelId != null) "$videoId|$effectiveVideoModel" else videoId
+            } catch (e: ProviderError.QuotaError) {
+                if (attempt == SUBMIT_MAX_ATTEMPTS - 1) throw e
+                sleeper(backoff); backoff = minOf(backoff * 2, SUBMIT_BACKOFF_CAP_MS)
+            } catch (e: ProviderError.TransientError) {
+                // 仅可重试的5xx类走长退避重试；其余上抛（P2-4：显式retryable字段）
+                if (!e.retryable || attempt == SUBMIT_MAX_ATTEMPTS - 1) throw e
+                sleeper(backoff); backoff = minOf(backoff * 2, SUBMIT_BACKOFF_CAP_MS)
+            }
+        }
+        throw ProviderError.TransientError("video submit failed after $SUBMIT_MAX_ATTEMPTS attempts")
+    }
+
+    override suspend fun pollResult(providerTaskId: String): PollResult {
+        val (taskId, taskModel) = providerTaskId.split("|", limit = 2).let { it.first() to it.getOrNull(1) }
+        val modelForPoll = taskModel?.takeIf { it.isNotBlank() } ?: effectiveVideoModel
+        // 自定义供应商走 OpenAI 兼容惯例 GET {base}/videos/{id}；Agnes 走官方推荐端点
+        // v1.9.27：官方推荐所有模式带 model_name 查询（keyframe/reference 模式不带会查不到任务）
+        val modelNameParam = if (baseUrlOverride == null) "&model_name=$modelForPoll" else ""
+        val out = when {
+            baseUrlOverride != null -> getJson("$effectiveBaseUrl/videos/$taskId")
+            region == AgnesRegion.CHINA -> getJson("$VIDEO_RESULT_URL_CN?video_id=$taskId$modelNameParam")
+            else -> getJson("$VIDEO_RESULT_URL?video_id=$taskId$modelNameParam")
+        }
+        val status = out["status"]?.jsonPrimitive?.content ?: "unknown"
+        return when (status) {
+            "completed" -> {
+                val url = out["url"]?.jsonPrimitive?.contentOrNull
+                    ?: out["metadata"]?.jsonObject?.get("url")?.jsonPrimitive?.contentOrNull ?: ""
+                PollResult.Completed(url)
+            }
+            "failed" -> {
+                // v1.9.14：error 字段可能是字符串也可能是对象，兼容两种形态，避免原因丢失
+                // v1.9.23：再套一层 JSON 字符串时递归提取最内层 message，避免把转义堆栈丢给用户
+                val err = out["error"]
+                val rawReason = when {
+                    err == null -> "unknown"
+                    err is JsonPrimitive -> err.contentOrNull ?: err.toString()
+                    else -> err.toString()
+                }
+                val reason = extractReadableError(rawReason)
+                println("AgnesProvider pollResult failed video_id=$providerTaskId rawReason=$rawReason readable=$reason")
+                PollResult.Failed(reason.take(400))
+            }
+            else -> PollResult.InProgress(out["progress"]?.jsonPrimitive?.intOrNull)
+        }
+    }
+
+    // 轮询自适应间隔：submitted初期30s，10分钟后降60s（PRD F09/架构§7.1）
+    suspend fun adaptivePollInterval(submittedAtMs: Long, nowMs: Long = System.currentTimeMillis()): Long =
+        if (nowMs - submittedAtMs < 10 * 60_000L) 30_000L else 60_000L
+
+    // ------------------------------------------------------------------
+    // TextProvider（enable_thinking=false 约定，避免reasoning吃空content）
+    // ------------------------------------------------------------------
+    override suspend fun chat(req: ChatRequest): ChatResponse {
+        val body = buildJsonObject {
+            // 第十轮：模型自动选择——按输入规模挑最合适的chat模型（官方目录512K/256K/256K）
+            //
+            // v1.9.5 修复：调用方（AiAgent）曾把 **providerId**（如 "agnes"）当作 modelId 传入，
+            // 而 "agnes" 并非任何官方模型 ID —— 该值非空使自动选模完全失效，官方网关直接拒绝，
+            // 表现为「设置页测试连通成功（validateKey 不传 model，走有效默认值 agnes-2.5-flash），
+            // 但 AI 助手聊天失败」。故官方网关下 model 必须命中官方目录，否则一律回退自动选模；
+            // 自定义 baseUrl（OpenAI 兼容供应商）尊重调用方配置，模型名不受官方目录限制。
+            val officialDir = setOf(MODEL_TEXT, MODEL_TEXT_MID, MODEL_TEXT_LIGHT)
+            val requested = req.model.trim()
+            val model = when {
+                baseUrlOverride != null -> requested.ifEmpty { pickTextModel(req) }
+                requested.isEmpty() || requested !in officialDir -> pickTextModel(req)
+                else -> requested
+            }
+            put("model", model)
+            put("messages", buildJsonArray {
+                req.messages.forEach { m ->
+                    if (m.imageUrl != null) {
+                        // OpenAI 视觉格式：image_url 支持 http(s)/data URI（官方目录：三模型均支持 image understanding）
+                        add(buildJsonObject {
+                            put("role", m.role)
+                            put("content", buildJsonArray {
+                                add(buildJsonObject { put("type", "text"); put("text", m.content) })
+                                add(buildJsonObject {
+                                    put("type", "image_url")
+                                    put("image_url", buildJsonObject { put("url", m.imageUrl) })
+                                })
+                            })
+                        })
+                    } else {
+                        add(buildJsonObject { put("role", m.role); put("content", m.content) })
+                    }
+                }
+            })
+            put("temperature", req.temperature)
+            req.maxTokens?.let { put("max_tokens", it) }
+            if (!req.enableThinking) {
+                // 默认false：agnes-2.5-flash reasoning会吃空content导致静默空响应
+                put("chat_template_kwargs", buildJsonObject { put("enable_thinking", false) })
+            }
+        }
+        // AI 助手对话单独用更耐心的重试策略，缓解上游 503 抖动
+        val out = postJson(
+            "/chat/completions",
+            body,
+            maxRetries = CHAT_MAX_RETRIES,
+            initialBackoffMs = CHAT_INITIAL_BACKOFF_MS,
+        )
+        val content = out["choices"]?.jsonArray?.firstOrNull()
+            ?.jsonObject?.get("message")?.jsonObject?.get("content")?.jsonPrimitive?.content
+            ?: throw ProviderError.ValidationError("unexpected chat response: ${out.toString().take(400)}")
+        return ChatResponse(content, out.toString())
+    }
+
+    // ------------------------------------------------------------------
+    // TextProvider.streamChat —— OpenAI 兼容 SSE 流式（T002：打字机展示）
+    // body 加 stream:true；逐行读 "data: {...}"，解析 choices[0].delta.content，
+    // "data: [DONE]" 结束。错误分类对齐 postJson（429/401/400/422 直抛）。
+    // ------------------------------------------------------------------
+    override fun streamChat(req: ChatRequest): Flow<String> = flow {
+        val body = buildJsonObject {
+            val officialDir = setOf(MODEL_TEXT, MODEL_TEXT_MID, MODEL_TEXT_LIGHT)
+            val requested = req.model.trim()
+            val model = when {
+                baseUrlOverride != null -> requested.ifEmpty { pickTextModel(req) }
+                requested.isEmpty() || requested !in officialDir -> pickTextModel(req)
+                else -> requested
+            }
+            put("model", model)
+            put("messages", buildJsonArray {
+                req.messages.forEach { m ->
+                    if (m.imageUrl != null) {
+                        add(buildJsonObject {
+                            put("role", m.role)
+                            put("content", buildJsonArray {
+                                add(buildJsonObject { put("type", "text"); put("text", m.content) })
+                                add(buildJsonObject {
+                                    put("type", "image_url")
+                                    put("image_url", buildJsonObject { put("url", m.imageUrl) })
+                                })
+                            })
+                        })
+                    } else {
+                        add(buildJsonObject { put("role", m.role); put("content", m.content) })
+                    }
+                }
+            })
+            put("temperature", req.temperature)
+            put("stream", true)
+            req.maxTokens?.let { put("max_tokens", it) }
+            if (!req.enableThinking) {
+                put("chat_template_kwargs", buildJsonObject { put("enable_thinking", false) })
+            }
+        }
+        val resp = client.post("$effectiveBaseUrl/chat/completions") {
+            contentType(ContentType.Application.Json)
+            header(HttpHeaders.Authorization, "Bearer ${currentApiKey()}")
+            setBody(body.toString())
+        }
+        when {
+            resp.status.value == 429 -> throw ProviderError.QuotaError("429 Too Many Requests (stream)")
+            resp.status.value == 401 -> throw ProviderError.AuthError("401 Unauthorized (stream)")
+            resp.status.value == 400 || resp.status.value == 422 ->
+                throw ProviderError.ValidationError("${resp.status.value} (stream): ${resp.snip()}")
+            resp.status.value != 200 -> throw ProviderError.TransientError("HTTP ${resp.status.value} (stream)")
+            else -> { /* 200：逐行读 SSE */ }
+        }
+        val channel = resp.bodyAsChannel()
+        var buffer = ""
+        while (!channel.isClosedForRead) {
+            val packet = channel.readRemaining(64 * 1024)
+            buffer += packet.readText()
+            var nl: Int
+            while (buffer.indexOf('\n').also { nl = it } >= 0) {
+                val line = buffer.substring(0, nl).removeSuffix("\r")
+                buffer = buffer.substring(nl + 1)
+                val data = line.removePrefix("data:").trim()
+                if (data.isBlank()) continue
+                if (data == "[DONE]") return@flow
+                val delta = runCatching {
+                    json.parseToJsonElement(data).jsonObject["choices"]
+                        ?.jsonArray?.firstOrNull()?.jsonObject
+                        ?.get("delta")?.jsonObject
+                        ?.get("content")?.jsonPrimitive?.contentOrNull
+                }.getOrNull() ?: continue
+                if (delta.isNotEmpty()) emit(delta)
+            }
+        }
+        // 收尾：无 chunk 也 emit 空串，保证调用方拿到完整流终止信号
+        emit("")
+    }
+
+    // ------------------------------------------------------------------
+    // ImageProvider
+    // ------------------------------------------------------------------
+    override suspend fun generateImage(req: ImageGenRequest): String {
+        val body = buildJsonObject {
+            put("model", effectiveImageModel)
+            put("prompt", req.prompt)
+            put("size", req.size)
+            // response_format 放 extra_body 而非顶层（对齐pavo实战注释）
+            put("extra_body", buildJsonObject {
+                put("response_format", "url")
+                if (req.inputImages.isNotEmpty()) {
+                    put("image", buildJsonArray { req.inputImages.forEach { add(JsonPrimitive(it)) } })
+                }
+                // ★v1.7.8 修复：Agnes 图像队列不支持 negative_prompt（400 invalid_request），
+                // 双写负向导致整张图生成失败。移除之；时代红线禁词改为在 AssetsViewModel 并入正向 prompt。
+            })
+        }
+        val out = postJson("/images/generations", body)
+        val item = out["data"]?.jsonArray?.firstOrNull()?.jsonObject
+            ?: throw ProviderError.ValidationError("unexpected image response: ${out.toString().take(400)}")
+        val url = item["url"]?.jsonPrimitive?.contentOrNull
+        val b64 = item["b64_json"]?.jsonPrimitive?.contentOrNull
+        return url ?: b64?.let { "data:image/png;base64,$it" }
+        ?: throw ProviderError.ValidationError("image item has no url/b64_json")
+    }
+}

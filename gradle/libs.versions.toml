@@ -35,6 +35,14 @@ media = "1.7.1"
 danmaku = "0.9.25"
 nanoHttpd = "2.3.1"
 okhttp = "5.3.2"
+# ---- AI 短剧工厂（modules/ai-core、modules/ai-app）独有依赖 ----
+ktor = "2.3.12"
+serializationJson = "1.7.3"
+coil = "2.6.0"
+securityCrypto = "1.1.0-alpha06"
+ffmpegKit = "8.1.7"
+smartException = "0.2.1"
+materialIconsCore = "1.7.8"
 chucker = "4.3.1"
 preference = "1.2.1"
 quickChineseTransfer = "0.2.17"
@@ -246,6 +254,19 @@ hilt-compiler = { module = "com.google.dagger:hilt-compiler", version.ref = "hil
 [bundles]
 coroutines = ["kotlinx-coroutines-core", "kotlinx-coroutines-android"]
 androidTest = ["androidx-espresso-core", "androidx-junit", "androidx-runner"]
+
+# ---- AI 短剧工厂（modules/ai-core、modules/ai-app）----
+ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
+ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
+ktor-client-content-negotiation = { module = "io.ktor:ktor-client-content-negotiation", version.ref = "ktor" }
+ktor-serialization-kotlinx-json = { module = "io.ktor:ktor-serialization-kotlinx-json", version.ref = "ktor" }
+ktor-client-mock = { module = "io.ktor:ktor-client-mock", version.ref = "ktor" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serializationJson" }
+coil-compose = { module = "io.coil-kt:coil-compose", version.ref = "coil" }
+security-crypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }
+ffmpeg-kit-min-gpl = { module = "dev.ffmpegkit-maintained:ffmpeg-kit-min-gpl", version.ref = "ffmpegKit" }
+smart-exception-java = { module = "com.arthenica:smart-exception-java", version.ref = "smartException" }
+compose-material-icons-core = { module = "androidx.compose.material:material-icons-core", version.ref = "materialIconsCore" }
 
 [plugins]
 

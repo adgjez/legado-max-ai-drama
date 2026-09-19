@@ -60,6 +60,14 @@
         app:allowDividerBelow="false"
         app:iconSpaceReserved="false" />
 
+    <io.legado.app.lib.prefs.Preference
+        android:icon="@drawable/ic_cfg_web"
+        android:key="aiDramaFactory"
+        android:summary="AI 短剧生产管线：项目 → 资产 → 分镜 → 渲染 → 成片"
+        android:title="AI短剧工厂"
+        app:allowDividerBelow="false"
+        app:iconSpaceReserved="false" />
+
     <io.legado.app.lib.prefs.PreferenceCategory
         android:title="@string/setting"
         app:allowDividerAbove="false"

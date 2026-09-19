@@ -9,6 +9,7 @@ import android.content.pm.ActivityInfo
 import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
 import android.os.Build
+import com.dramafactory.app.AiAppBootstrap
 import com.github.liuyueyi.quick.transfer.constants.TransType
 import com.jeremyliao.liveeventbus.LiveEventBus
 import com.jeremyliao.liveeventbus.logger.DefaultLogger
@@ -96,7 +97,9 @@ class App : Application() {
             LogUtils.logDeviceInfo()
             // 预下载Cronet so
             Cronet.preDownload()
-            createNotificationChannels()
+createNotificationChannels()
+            // AI短剧工厂初始化（AppGraph依赖图 + 渲染队列作用域 + 开机续跑）
+            AiAppBootstrap.init(this@App)
             // LiveEventBus 全局配置：基于 LiveData 的事件总线，用于跨组件通信
             LiveEventBus.config()
                 .lifecycleObserverAlwaysActive(true) // 观察者始终活跃，不受 Lifecycle 状态限制（后台也能收到事件）

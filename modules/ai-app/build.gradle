@@ -1,0 +1,90 @@
+// ai-app：AI短剧工厂 Android 壳（五页面 Compose UI + Room 持久化 + 前台渲染服务）
+// 移入宿主工程：由 src-ai-drama/app 移植，以 library 形式并入宿主单 APK；
+// 包名与 R 命名空间保持 com.dramafactory.app，全部依赖对齐宿主版本目录
+plugins {
+    alias libs.plugins.android.library
+    alias libs.plugins.kotlin.android
+    alias libs.plugins.kotlin.compose
+    alias libs.plugins.kotlin.serialization
+    alias libs.plugins.ksp
+}
+
+android {
+    compileSdk = compile_sdk_version
+    namespace = 'com.dramafactory.app'
+    kotlin {
+        jvmToolchain {
+            languageVersion.set(JavaLanguageVersion.of(17))
+        }
+    }
+    defaultConfig {
+        minSdk 29
+        versionCode 108
+        versionName "1.9.38" // AI短剧工厂自版本号（更新通道比对用）
+        // library BuildConfig 显式生成 VERSION_NAME（ViewModels.kt 更新通道比对依赖）
+        buildConfigField "String", "VERSION_NAME", "\"1.9.38\""
+        consumerProguardFiles "consumer-rules.pro"
+    }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = "17"
+        freeCompilerArgs += ["-opt-in=androidx.compose.material3.ExperimentalMaterial3Api"]
+    }
+    packaging {
+        resources.excludes += "META-INF/*"
+    }
+    // Room schema 历史导出（迁移基准，移植自 ai-drama-factory app/schemas）
+    ksp {
+        arg("room.schemaLocation", "$projectDir/schemas")
+    }
+}
+
+dependencies {
+    implementation(project(":modules:ai-core"))
+
+    // Compose + Material3（版本统一走宿主 BOM 2026.08.00，不自声明 BOM）
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.compose.foundation)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.core)
+    debugImplementation(libs.compose.ui.tooling)
+
+    implementation(libs.activity.compose)
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.runtime.compose)
+    implementation(libs.bundles.coroutines)
+
+    // Room（版本对齐宿主 2.8.4）
+    implementation(libs.room.runtime)
+    implementation(libs.room.ktx)
+    ksp(libs.room.compiler)
+    androidTestImplementation(libs.room.testing)
+
+    // 网络与序列化
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.okhttp)
+
+    // 图片加载（Coil Compose 缩略图/异步图）
+    implementation(libs.coil.compose)
+
+    // Key 安全存储（AndroidKeyVault）
+    implementation(libs.security.crypto)
+
+    // 视频拼接：ffmpeg-kit-min-gpl（含 x264）+ smart-exception 胶水类
+    implementation(libs.ffmpeg.kit.min.gpl)
+    implementation(libs.smart.exception.java)
+
+    testImplementation "org.jetbrains.kotlin:kotlin-test-junit5:${libs.versions.kotlin.get()}"
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.ktor.client.mock)
+}

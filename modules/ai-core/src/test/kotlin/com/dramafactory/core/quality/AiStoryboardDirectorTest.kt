@@ -1,0 +1,148 @@
+package com.dramafactory.core.quality
+
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+import kotlin.test.assertNull
+
+/** 第十轮：AI编剧+导演管线单测（纯解析/校验逻辑，不调网络） */
+class AiStoryboardDirectorTest {
+
+    @Test
+    fun parseShots_严格JSON() {
+        val json = """{"shots":[
+            {"shot_no":1,"action":"他拔剑出鞘","dialogue":"出招吧","duration_seconds":6,"characters":["林晚"],"beat_ref":"B01"},
+            {"shot_no":2,"action":"她侧身避开","narration":"风声骤起"}
+        ]}"""
+        val shots = AiStoryboardDirector.parseShots(json).first
+        assertEquals(2, shots.size)
+        assertEquals("出招吧", shots[0].dialogue)
+        assertEquals("林晚", shots[0].characterNames.first())
+        assertEquals(6.0, shots[0].durationSeconds)
+        assertNull(shots[1].dialogue)
+        assertEquals("风声骤起", shots[1].narration)
+    }
+
+    @Test
+    fun parseShots_markdown栅栏容错() {
+        val wrapped = "```json\n{\"shots\":[{\"shot_no\":1,\"action\":\"转身\"}]}\n```"
+        val shots = AiStoryboardDirector.parseShots(wrapped).first
+        assertEquals(1, shots.size)
+        assertEquals("转身", shots[0].action)
+    }
+
+    @Test
+    fun parseShots_缺字段默认值() {
+        val shots = AiStoryboardDirector.parseShots("""{"shots":[{"action":"x"}]}""").first
+        assertEquals(1, shots.size)
+        assertEquals(6.0, shots[0].durationSeconds)   // 默认时长
+        assertEquals(1, shots[0].shotNo)              // 缺号自动补
+    }
+
+    @Test
+    fun parseShots_非JSON返回空() {
+        assertTrue(AiStoryboardDirector.parseShots("这不是json").first.isEmpty())
+        assertTrue(AiStoryboardDirector.parseShots("""{"shots":"not-array"}""").first.isEmpty())
+    }
+
+    @Test
+    fun parseVisuals_映射镜号() {
+        val m = AiStoryboardDirector.parseVisuals(
+            """{"visuals":[{"shot_no":1,"visual":"近景缓推"},{"shot_no":2,"visual":"全景横移"}]}""")
+        assertEquals(2, m.size)
+        assertEquals("近景缓推", m[1])
+        assertEquals("全景横移", m[2])
+    }
+
+    @Test
+    fun 未提供环境事实时不应由系统自动补写() {
+        val shots = AiStoryboardDirector.parseShots("""{"shots":[{"shot_no":1,"action":"站在门外","duration_seconds":6},{"shot_no":2,"action":"进入室内","duration_seconds":6,"carry_over":"推门进入"}]}""").first
+        assertTrue(shots.all { it.sceneContext == null })
+    }
+    @Test
+    fun parseShots_解析场景连续性字段() {
+        val json = """{"shots":[{"shot_no":1,"action":"站在门外","scene_context":"雨夜，院门外，地面湿滑","carry_over":"她抬手敲门"},{"shot_no":2,"action":"推门进入","scene_context":"仍是同一雨夜，从门外进入昏暗门厅","carry_over":"她推门进入门厅"}]}"""
+        val shots = AiStoryboardDirector.parseShots(json).first
+        assertEquals("雨夜，院门外，地面湿滑", shots[0].sceneContext)
+        assertEquals("仍是同一雨夜，从门外进入昏暗门厅", shots[1].sceneContext)
+    }
+
+    @Test
+    fun parseShots_承接字段可解析() {
+        val json = """{"shots":[{"shot_no":2,"action":"推门进入堂屋","carry_over":"女刺客从庭院进入堂屋，视线锁定密函"}]}"""
+        val shot = AiStoryboardDirector.parseShots(json).first.single()
+        assertEquals("女刺客从庭院进入堂屋，视线锁定密函", shot.carryOver)
+    }
+
+    @Test
+    fun 台词逐字校验() {
+        val script = "林晚冷声道：「留下吧。」陈默停住了脚步。"
+        assertTrue(AiStoryboardDirector.verbatimIn("留下吧", script))
+        assertTrue(!AiStoryboardDirector.verbatimIn("留下来", script), "改写台词应判不逐字")
+    }
+
+    @Test
+    fun generate_连贯性错误会定向修复并保留其他镜头() = kotlinx.coroutines.runBlocking {
+        val responses = ArrayDeque(listOf(
+            com.dramafactory.core.model.ChatResponse(
+                """{"shots":[{"shot_no":1,"action":"翻墙入院","duration_seconds":6},{"shot_no":2,"action":"密函静置","duration_seconds":5}]}""", ""),
+            com.dramafactory.core.model.ChatResponse(
+                """{"shots":[{"shot_no":2,"action":"推门进入堂屋，目光锁定密函","duration_seconds":5,"carry_over":"女刺客从庭院进入堂屋，视线锁定密函"}]}""", ""),
+            com.dramafactory.core.model.ChatResponse("""{"visuals":[]}""", "")
+        ))
+        val result = AiStoryboardDirector.generate("女刺客翻墙后进入堂屋查看密函", chat = {
+            responses.removeFirst()
+        })
+        assertEquals("推门进入堂屋，目光锁定密函", result.shots[1].action)
+        assertTrue(result.gateErrors.isEmpty())
+    }
+
+
+    @Test
+    fun parseShots_assetIds仅保留catalog内的() {
+        val catalog = listOf(
+            AiStoryboardDirector.AssetSnapshot("a_1", "character", "张角", "灰袍道长左脸有疤"),
+            AiStoryboardDirector.AssetSnapshot("a_2", "scene", "破庙", "残破木结构"),
+        )
+        val json = """{"shots":[
+            {"shot_no":1,"action":"张角走入破庙","asset_ids":["a_1","a_2","a_999"]}
+        ]}"""
+        val shots = AiStoryboardDirector.parseShots(json, catalog).first
+        assertEquals(1, shots.size)
+        assertEquals(listOf("a_1","a_2"), shots[0].assetIds, "非catalog的a_999应被过滤")
+    }
+
+    @Test
+    fun parseShots_无catalog时assetIds一律空() {
+        val json = """{"shots":[{"shot_no":1,"action":"x","asset_ids":["a_1"]}]}"""
+        val shots = AiStoryboardDirector.parseShots(json, emptyList()).first
+        assertEquals(1, shots.size)
+        assertTrue(shots[0].assetIds.isEmpty(), "无catalog注入时不接收任何asset_id")
+    }
+
+    // v1.9.17：引用统计——诊断「分镜没引用资产」断在目录/LLM/幻觉哪一环
+    @Test
+    fun parseShots_返回资产引用统计() {
+        val catalog = listOf(
+            AiStoryboardDirector.AssetSnapshot("a_1", "character", "张角", "灰袍道长"),
+            AiStoryboardDirector.AssetSnapshot("a_2", "scene", "破庙", "残破木结构"),
+        )
+        val json = """{"shots":[{"shot_no":1,"action":"张角走入","asset_ids":["a_1","a_999"]}]}"""
+        val (shots, stats) = AiStoryboardDirector.parseShots(json, catalog)
+        assertEquals(1, shots.size)
+        assertEquals(2, stats.catalogSize, "目录项数")
+        assertEquals(2, stats.rawRefs, "LLM 原始引用数（a_1 + a_999）")
+        assertEquals(1, stats.keptRefs, "仅 a_1 命中目录")
+        assertEquals(1, stats.droppedRefs, "a_999 为幻觉 id，应被丢弃")
+    }
+
+    @Test
+    fun parseShots_LLM未输出assetIds时统计为0() {
+        val catalog = listOf(AiStoryboardDirector.AssetSnapshot("a_1", "character", "张角", "灰袍"))
+        val json = """{"shots":[{"shot_no":1,"action":"张角走入"}]}"""
+        val (_, stats) = AiStoryboardDirector.parseShots(json, catalog)
+        assertEquals(1, stats.catalogSize)
+        assertEquals(0, stats.rawRefs, "LLM 没输出 asset_ids → 指令未跟随")
+        assertEquals(0, stats.keptRefs)
+    }
+}

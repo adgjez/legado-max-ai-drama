@@ -1,0 +1,35 @@
+// ai-core：AI短剧工厂纯Kotlin引擎（JVM可单测，无Android依赖）
+// 移入宿主工程：由 src-ai-drama/core-engine 移植，版本统一走宿主版本目录
+plugins {
+    alias libs.plugins.kotlin.jvm
+    alias libs.plugins.kotlin.serialization
+}
+
+kotlin {
+    jvmToolchain {
+        languageVersion.set(JavaLanguageVersion.of(17))
+    }
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+dependencies {
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.okhttp)
+    implementation(libs.ktor.client.content.negotiation)
+    implementation(libs.ktor.serialization.kotlinx.json)
+
+    testImplementation "org.jetbrains.kotlin:kotlin-test-junit5:${libs.versions.kotlin.get()}"
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.ktor.client.mock)
+}
+
+tasks.test {
+    useJUnitPlatform()
+    testLogging { events("passed", "failed", "skipped") }
+}

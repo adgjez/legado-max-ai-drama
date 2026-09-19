@@ -1,0 +1,282 @@
+package com.dramafactory.app.ui
+
+import com.dramafactory.core.model.ConnectionInfo
+import com.dramafactory.core.provider.KeyVault
+import com.dramafactory.core.provider.VideoProvider
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.withContext
+
+/**
+ * 设置页ViewModel核心逻辑（P0）——与Android解耦，JVM可单测。
+ *
+ * 职责：视频模型供应商选择（MVP仅Agnes）+ API Key保存（KeyVault）+ 测试连通。
+ * 语义约束：
+ * - Key明文只在输入框存在，测试/保存后立即清出UI状态；
+ * - 测试连通用「候选Key」直接验证（不落库），通过后才允许保存——避免坏Key覆盖好Key；
+ * - UI只见masked掩码（sk-***abc），永不回显明文。
+ */
+class SettingsLogic(
+    /** v1.9.0：按供应商 id 动态解析 VideoProvider（agnes/kling/jimeng/runway/luma/pika/custom） */
+    private val videoProviderFor: (String) -> VideoProvider,
+    /** v1.9.0：供应商 id → KeyVault configId（含 region 分池） */
+    private val configIdFor: (String) -> String,
+        private val keyVault: KeyVault,
+    configId: String,
+    /** v1.9.0：保存/切换供应商时持久化激活供应商 */
+    private val activate: (String) -> Unit = {},
+    /** v1.9.24：Agnes 视频模型偏好读写（解耦 AppGraph，单测可注入空实现） */
+    private val videoModelReader: () -> String? = { null },
+    private val videoModelPersister: suspend (String?) -> Unit = {},
+    private val io: CoroutineDispatcher = Dispatchers.IO,
+) {
+    /**
+     * v1.8.9：Agnes Key 按 region 分池（中国站与国际站不共用 Key）。
+     * 默认=构造传入（国际站 agnes-video）；切换 Agnes 站点后由 SettingsViewModel 更新为
+     * agnesScopedConfigId(CONFIG_VIDEO, region) 并触发 refresh() 刷新掩码。
+     */
+    var scopedConfigId: String = configId
+        private set
+
+    /** v1.8.9：region 切换后更新 Key 池目标 configId */
+    fun updateConfigId(newConfigId: String) {
+        scopedConfigId = newConfigId
+    }
+
+    /** 页面状态 */
+    data class UiState(
+        val providerLabel: String = "Agnes（MVP唯一供应商）",
+        val selectedProviderId: String = "agnes",
+        // 自定义模型表单（OpenAI兼容）
+        val customBaseUrl: String = "",
+        val customModelId: String = "",
+        val customApiKey: String = "",
+        val customNote: String = "",
+        val customSaved: Boolean = false,
+        val keyInput: String = "",              // 输入框明文（仅输入期间）
+        val maskedSaved: String? = null,        // 已存Key掩码；null=未配置
+        val testing: Boolean = false,
+        val testResult: TestResult? = null,
+        val saved: Boolean = false,             // 保存成功一次性提示
+        // ---- 更新通道（v1.9.3 / v1.9.4）----
+        val updateChecking: Boolean = false,    // 正在检查更新
+        val updateAvailable: UpdateInfo? = null,// 非空=发现新版本（持续提示，直至用户忽略或已更新）
+        val updateLatest: Boolean = false,      // 已是最新（点击检查后的一次性确认）
+        val updateError: String? = null,        // 检查失败原因
+        // ---- v1.9.24：Agnes 视频模型偏好（null=默认 agnes-video-v2.0）----
+        val selectedVideoModel: String? = null,
+        // ---- 在线下载安装（v1.9.4 方案B）----
+        val downloading: Boolean = false,       // 正在下载 APK
+        val downloadBytes: Long = 0,            // 已下载字节
+        val downloadTotal: Long? = null,        // 总字节（可为空）
+        val downloadError: String? = null,      // 下载失败原因
+        val downloadDone: Boolean = false,       // 下载完成待安装
+    )
+
+    /** 更新通道：发现的新版本信息 */
+    data class UpdateInfo(
+        val versionName: String,
+        val versionCode: Int,
+        val downloadUrl: String,
+        val notes: String? = null,
+    )
+
+    sealed interface TestResult {
+        data class Success(val latencyMs: Long) : TestResult
+        data class Failure(val message: String) : TestResult
+    }
+
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> get() = _state
+
+    /** 进入页面时刷新已存Key掩码（v1.8.9：按当前 region 分池的 configId 读取） */
+    suspend fun refresh() {
+        val masked = runCatching { keyVault.masked(scopedConfigId) }
+            .getOrNull()?.takeIf { it != "<empty>" }
+        _state.value = _state.value.copy(maskedSaved = masked, saved = false)
+    }
+
+    fun onKeyChanged(text: String) {
+        _state.value = _state.value.copy(keyInput = text, saved = false)
+    }
+
+    // ==================== 供应商选择（第四轮新增） ====================
+
+    /**
+     * 选择供应商。AVAILABLE的立即可配；COMING_SOON仅标记选择态并提示待接入。
+     * 自定义模型选中后展示 base_url/model_id/api_key 表单。
+     */
+    fun selectProvider(providerId: String): Boolean {
+        val info = ProviderRegistry.byId(providerId) ?: return false
+        // v1.9.0：按所选供应商切换 Key 池目标 configId（agnes 走 region 分池，其余 ${id}-video）
+        scopedConfigId = configIdFor(providerId)
+        _state.value = _state.value.copy(
+            selectedProviderId = providerId,
+            providerLabel = "${info.label}（${if (info.status == ProviderRegistry.Status.AVAILABLE) "可用" else "待接入"}）",
+            saved = false, customSaved = false)
+        val available = info.status == ProviderRegistry.Status.AVAILABLE
+        // v1.9.0：选中可用供应商即持久化激活，重启后视频路由仍指向它
+        if (available) activate(providerId)
+        // v1.9.24：选中 Agnes 时回填已存视频模型偏好，使选择器显示当前生效项
+        if (available && providerId == "agnes") {
+            _state.value = _state.value.copy(selectedVideoModel = videoModelReader())
+        }
+        return available
+    }
+
+    /** v1.9.24：Agnes 视频模型选择变更（暂存 UI 状态，saveVideoModel 落库生效） */
+    fun onVideoModelChanged(modelId: String?) {
+        _state.value = _state.value.copy(selectedVideoModel = modelId)
+    }
+
+    /** v1.9.24：持久化 Agnes 视频模型偏好并热重建 provider */
+    suspend fun saveVideoModel() {
+        videoModelPersister(_state.value.selectedVideoModel)
+    }
+
+    fun onCustomFieldChanged(field: String, value: String) {
+        val s = _state.value
+        _state.value = when (field) {
+            "baseUrl" -> s.copy(customBaseUrl = value, customSaved = false)
+            "modelId" -> s.copy(customModelId = value, customSaved = false)
+            "apiKey" -> s.copy(customApiKey = value, customSaved = false)
+            "note" -> s.copy(customNote = value, customSaved = false)
+            else -> s
+        }
+    }
+
+    /**
+     * 保存自定义模型配置：OpenAI兼容格式，写入供应商配置表（provider_configs）。
+     * Key同时入KeyVault加密存储（configId=custom-video），表单明文立即清出。
+     * @return true=保存成功
+     */
+    suspend fun saveCustomModel(): Boolean {
+        val cfg = ProviderRegistry.CustomModelConfig.create(
+            _state.value.customBaseUrl, _state.value.customModelId,
+            _state.value.customApiKey, _state.value.customNote)
+            ?: run { _state.value = _state.value.copy(
+                testResult = TestResult.Failure("请填写合法的 base_url(http开头)/model_id/api_key")); return false }
+        withContext(io) {
+            keyVault.save("custom-video", "custom", cfg.apiKey)
+            persistCustomConfig?.invoke(cfg)
+        }
+        _state.value = _state.value.copy(customApiKey = "", customSaved = true)
+        return true
+    }
+
+    /** App层注入：自定义模型配置落库provider_configs表（base_url/model_id/note进extra_params JSON） */
+    var persistCustomConfig: suspend (ProviderRegistry.CustomModelConfig) -> Unit = {}
+
+    /**
+     * 「测试连通」：用候选Key调validateKey（最小成本请求）。
+     * 成功→显示延迟；失败→显示错误分类信息（401/429/网络等）。
+     */
+    suspend fun testConnection() {
+        val key = _state.value.keyInput.trim()
+        if (key.isEmpty()) {
+            _state.value = _state.value.copy(testResult = TestResult.Failure("请先输入API Key"))
+            return
+        }
+        _state.value = _state.value.copy(testing = true, testResult = null)
+        val result = withContext(io) { videoProviderFor(_state.value.selectedProviderId).validateKey(key) }
+        _state.value = when {
+            result.isSuccess -> {
+                val info = result.getOrThrow()
+                _state.value.copy(testing = false,
+                    testResult = if (info.ok) TestResult.Success(info.latencyMs)
+                                 else TestResult.Failure(info.detail.ifEmpty { "连通失败" }))
+            }
+            else -> _state.value.copy(testing = false,
+                testResult = TestResult.Failure(result.exceptionOrNull()?.message ?: "未知错误"))
+        }
+    }
+
+    /**
+     * 保存到KeyVault。约定：测试通过后才允许保存（防坏Key覆盖好Key）；
+     * 若用户跳过测试强行保存也放行（尊重用户），但返回false由UI提示风险。
+     * 保存成功后立即清空输入框明文并刷新掩码。
+     */
+    suspend fun saveKey(forceWithoutTest: Boolean = false): Boolean {
+        val key = _state.value.keyInput.trim()
+        if (key.isEmpty()) return false
+        val tested = (_state.value.testResult as? TestResult.Success) != null
+        if (!tested && !forceWithoutTest) return false
+        withContext(io) {
+            keyVault.save(scopedConfigId, videoProviderFor(_state.value.selectedProviderId).id, key)
+            // v1.9.0：保存即激活该供应商（持久化），使其进入视频路由
+            activate(_state.value.selectedProviderId)
+        }
+        _state.value = _state.value.copy(keyInput = "", saved = true)
+        refresh()
+        return true
+    }
+
+    /** 删除已存Key（换Key前清理） */
+    suspend fun deleteKey() {
+        withContext(io) { keyVault.delete(scopedConfigId) }
+        _state.value = _state.value.copy(maskedSaved = null, testResult = null)
+    }
+
+    // ==================== 更新通道（v1.9.3）====================
+
+    /**
+     * 检查更新：拉取远程最新 release 并与当前版本比对。
+     * - 有新版本 → 置 updateAvailable（持续提示，跨页面返回不消失）；
+     * - 已是最新 → 置 updateLatest（一次性确认提示）；
+     * - 失败 → 置 updateError。
+     * 调用前清空旧状态，避免上一次结果残留。
+     *
+     * @param checker 注入式检查器（生产用 UpdateChecker；单测用假实现）
+     */
+    suspend fun checkUpdate(checker: suspend () -> com.dramafactory.app.update.UpdateResult) {
+        _state.value = _state.value.copy(
+            updateChecking = true, updateAvailable = null, updateLatest = false, updateError = null)
+        val r = withContext(io) { checker() }
+        _state.value = when (r) {
+            is com.dramafactory.app.update.UpdateResult.Latest ->
+                _state.value.copy(updateChecking = false, updateLatest = true)
+            is com.dramafactory.app.update.UpdateResult.UpdateAvailable ->
+                _state.value.copy(updateChecking = false,
+                    updateAvailable = UpdateInfo(r.versionName, r.versionCode, r.downloadUrl, r.notes))
+            is com.dramafactory.app.update.UpdateResult.Error ->
+                _state.value.copy(updateChecking = false, updateError = r.message)
+        }
+    }
+
+    /** 用户忽略当前新版本提示（下次进入仍会重新检查；仅本次会话内隐藏） */
+    fun dismissUpdate() {
+        _state.value = _state.value.copy(updateAvailable = null, updateLatest = false, updateError = null)
+    }
+
+    // ==================== 在线下载安装（v1.9.4 方案B）====================
+
+    /** 下载进度回调：更新字节数与总量（仅下载中时生效） */
+    fun onDownloadProgress(bytes: Long, total: Long?) {
+        if (!_state.value.downloading) return
+        _state.value = _state.value.copy(downloadBytes = bytes, downloadTotal = total)
+    }
+
+    /** 下载开始 */
+    fun onDownloadStart() {
+        _state.value = _state.value.copy(downloading = true, downloadBytes = 0, downloadTotal = null,
+            downloadError = null, downloadDone = false)
+    }
+
+    /** 下载完成（等待系统安装器确认） */
+    fun onDownloadDone() {
+        _state.value = _state.value.copy(downloading = false, downloadDone = true)
+    }
+
+    /** 下载失败 */
+    fun onDownloadError(message: String) {
+        _state.value = _state.value.copy(downloading = false, downloadError = message)
+    }
+
+    /** 重置下载状态（用户关闭安装界面或重试） */
+    fun resetDownload() {
+        _state.value = _state.value.copy(downloading = false, downloadBytes = 0, downloadTotal = null,
+            downloadError = null, downloadDone = false)
+    }
+}

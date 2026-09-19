@@ -202,6 +202,10 @@ class MyFragment() : BaseFragment(R.layout.fragment_my_config), MainFragmentInte
                 "downloadManage" -> startActivity<DownloadManageActivity>()
                 "about" -> startActivity<AboutActivity>()
                 "exit" -> activity?.finish()
+                // AI短剧工厂入口：启动 drama 五页面主界面（项目/资产/分镜/渲染/成片）
+                "aiDramaFactory" -> startActivity(
+                    Intent(requireContext(), com.dramafactory.app.MainActivity::class.java)
+                )
             }
             return super.onPreferenceTreeClick(preference)
         }

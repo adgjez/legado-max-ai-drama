@@ -199,6 +199,19 @@ android {
     }
     packaging {
         resources.excludes.add('META-INF/*')
+        // 调试包瘦身：ABI 分拆仅用于 Release，调试 universal 包会叠入 x86/x86_64/armeabi-v7a
+        // 三层原生库（ffmpeg-kit 在 x86_64 上就占约 26MiB）；现代真机均为 arm64-v8a，
+        // debug 包仅保留 arm64-v8a 可显著缩小体积，Release 的 splits 语义不受影响。
+        def debugOnlyAbiFilter = gradle.startParameter.taskNames.any {
+            it.toLowerCase().contains('debug')
+        }
+        if (debugOnlyAbiFilter) {
+            jniLibs.excludes.addAll([
+                    'lib/armeabi-v7a/**',
+                    'lib/x86/**',
+                    'lib/x86_64/**'
+            ])
+        }
     }
     
     sourceSets {

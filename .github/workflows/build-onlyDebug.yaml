@@ -48,6 +48,46 @@ jobs:
           # 在 Linux 环境下执行，精准打包 AppMaxDebug 变体，并跳过 Google Services 检查
           ./gradlew assembleAppMaxDebug -x processAppSDebugGoogleServices --parallel --daemon
 
+      - name: Report APK Size Distribution
+        run: |
+          python3 - <<'EOF'
+          import zipfile, collections, os
+          d = 'app/build/outputs/apk/appMax/debug'
+          apk = [f for f in os.listdir(d) if f.endswith('.apk')][0]
+          z = zipfile.ZipFile(os.path.join(d, apk))
+          total = sum(i.file_size for i in z.infolist())
+          print(f'APK={apk} total_bytes={total} MiB={total/1024/1024:.1f}')
+          by_dir = collections.defaultdict(int)
+          for i in z.infolist():
+              by_dir[i.filename.split('/')[0]] += i.file_size
+          print('== By top dir ==')
+          for k, v in sorted(by_dir.items(), key=lambda x: -x[1]):
+              print(f'{v/1024/1024:6.1f} MiB  {k}')
+          libs = [(i.filename, i.file_size) for i in z.infolist() if i.filename.startswith('lib/')]
+          abi = collections.defaultdict(int)
+          for f, s in libs:
+              abi[f.split('/')[1]] += s
+          print('== Native libs by ABI ==')
+          for k, v in sorted(abi.items(), key=lambda x: -x[1]):
+              print(f'{v/1024/1024:6.1f} MiB  lib/{k}')
+          print('== Top 15 native libs ==')
+          for f, s in sorted(libs, key=lambda x: -x[1])[:15]:
+              print(f'{s/1024/1024:6.1f} MiB  {f}')
+          print('== DEX ==')
+          for i in z.infolist():
+              if i.filename.endswith('.dex'):
+                  print(f'{i.file_size/1024/1024:6.1f} MiB  {i.filename}')
+          print('== Resources by ext (non-lib/dex) ==')
+          by_ext = collections.defaultdict(int)
+          for i in z.infolist():
+              if i.filename.startswith(('lib/', 'classes')) or i.filename.endswith('.dex'):
+                  continue
+              ext = os.path.splitext(i.filename.split('/')[-1])[1] or '[dir]'
+              by_ext[ext] += i.file_size
+          for k, v in sorted(by_ext.items(), key=lambda x: -x[1])[:15]:
+              print(f'{v/1024/1024:6.1f} MiB  {k}')
+          EOF
+
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:

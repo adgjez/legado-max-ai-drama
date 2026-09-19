@@ -248,13 +248,6 @@ zxing-lite = { module = "com.github.jenly1314:zxing-lite", version.ref = "zxingL
 hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }
 hilt-compiler = { module = "com.google.dagger:hilt-compiler", version.ref = "hilt" }
 
-
-
-
-[bundles]
-coroutines = ["kotlinx-coroutines-core", "kotlinx-coroutines-android"]
-androidTest = ["androidx-espresso-core", "androidx-junit", "androidx-runner"]
-
 # ---- AI 短剧工厂（modules/ai-core、modules/ai-app）----
 ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor" }
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor" }
@@ -267,6 +260,15 @@ security-crypto = { module = "androidx.security:security-crypto", version.ref = 
 ffmpeg-kit-min-gpl = { module = "dev.ffmpegkit-maintained:ffmpeg-kit-min-gpl", version.ref = "ffmpegKit" }
 smart-exception-java = { module = "com.arthenica:smart-exception-java", version.ref = "smartException" }
 compose-material-icons-core = { module = "androidx.compose.material:material-icons-core", version.ref = "materialIconsCore" }
+
+
+
+
+
+[bundles]
+coroutines = ["kotlinx-coroutines-core", "kotlinx-coroutines-android"]
+androidTest = ["androidx-espresso-core", "androidx-junit", "androidx-runner"]
+
 
 [plugins]
 

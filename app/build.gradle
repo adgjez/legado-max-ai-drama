@@ -131,9 +131,12 @@ android {
 
             applicationIdSuffix = '.debug'
             versionNameSuffix = 'debug'
-            // minifyEnabled true
-            // shrinkResources = true
-            // proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro', 'cronet-proguard-rules.pro'
+            // 包体瘦身：debug 复用 release 已长期验证的 minify/shrink 规则集，
+            // 压制多 dex（约115MiB uncompressed）与资源体积；ai-app consumer-rules
+            // 的 keep com.dramafactory.** 随 library 合并进本配置，drama 代码不受裁剪。
+            minifyEnabled = true
+            shrinkResources = true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro', 'cronet-proguard-rules.pro'
         }
     }
     // ABI 分拆仅用于 Release 发布产物；Debug 本地构建保持单一 universal 包，

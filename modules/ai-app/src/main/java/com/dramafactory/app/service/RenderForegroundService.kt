@@ -79,7 +79,7 @@ class RenderForegroundService : Service() {
             android.util.Log.e("RenderFGS", "startForeground failed", e)
             runCatching {   // 兜底：最小通知再试一次，仍失败则停止自身避免5秒超时崩溃
                 startForeground(NOTIFICATION_ID, NotificationCompat.Builder(this, CHANNEL_ID)
-                    .setSmallIcon(android.R.drawable.ai_ic_media_play)
+                    .setSmallIcon(R.drawable.ai_ic_media_play)
                     .setContentTitle("AI短剧工厂 · 渲染服务").build())
             }.onFailure {
                 stopSelf()
@@ -127,7 +127,7 @@ class RenderForegroundService : Service() {
             else -> "共$total 镜 · 已完成$done" + (etaMin?.let { " · ETA约$it 分钟" } ?: "")
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ai_ic_media_play)
+            .setSmallIcon(R.drawable.ai_ic_media_play)
             .setContentTitle("AI短剧工厂 · 渲染中")
             .setContentText(text)
             .setOngoing(true)

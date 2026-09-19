@@ -31,9 +31,9 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- 成片导出分享 FileProvider（authority 固定，避免与宿主 .fileProvider 冲突） -->
+        <!-- 成片导出分享 FileProvider（子类注册规避宿主同名合并冲突；authority 固定） -->
         <provider
-            android:name="androidx.core.content.FileProvider"
+            android:name=".DramaFileProvider"
             android:authorities="com.dramafactory.app.fileprovider"
             android:exported="false"
             android:grantUriPermissions="true">
